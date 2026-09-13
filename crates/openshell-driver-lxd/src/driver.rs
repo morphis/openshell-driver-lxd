@@ -565,13 +565,27 @@ impl LxdComputeDriver {
         Ok(network)
     }
 
-    /// Resolves `OPENSHELL_ENDPOINT` from the sandbox's own target network's
-    /// host-side bridge IP and the configured gateway gRPC port.
+    /// Resolves `OPENSHELL_ENDPOINT`: `--gateway-endpoint` when set, otherwise
+    /// the host-side address of the sandbox's network and the configured
+    /// gateway gRPC port.
     fn resolve_gateway_endpoint(
         &self,
         network_name: &str,
         network: &lxd_client::Network,
     ) -> Result<String, DriverError> {
+        if let Some(endpoint) = &self.config.gateway_endpoint {
+            return Ok(endpoint.clone());
+        }
+        // An OVN network's address is its virtual router's, which nothing on
+        // the host can listen on; deriving the endpoint from it would send
+        // every supervisor to the router.
+        if network.type_ == "ovn" {
+            return Err(DriverError::FailedPrecondition(format!(
+                "network {network_name:?} is an OVN network, whose address belongs to its \
+                 virtual router rather than the gateway; set the driver's --gateway-endpoint \
+                 to the URL sandboxes reach the gateway at"
+            )));
+        }
         let cidr = network.config.get("ipv4.address").ok_or_else(|| {
             DriverError::FailedPrecondition(format!(
                 "network {network_name:?} has no ipv4.address configured"

@@ -21,6 +21,18 @@ case "$1" in
                 break
             done
         fi
+
+        # Use the name servers the network hands out. The network's gateway
+        # is not one on every network type: on OVN the router address answers
+        # no DNS, and the servers offered are the uplink's.
+        if [ -n "$dns" ]; then
+            {
+                [ -n "$domain" ] && printf 'search %s\n' "$domain"
+                for server in $dns; do
+                    printf 'nameserver %s\n' "$server"
+                done
+            } > /etc/resolv.conf.dhcp && mv /etc/resolv.conf.dhcp /etc/resolv.conf
+        fi
         ;;
 esac
 

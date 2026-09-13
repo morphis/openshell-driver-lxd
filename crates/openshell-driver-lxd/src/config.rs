@@ -205,10 +205,19 @@ pub struct Config {
     pub lxd_server_ca: Option<PathBuf>,
 
     /// gRPC port the gateway listens on, used to build OPENSHELL_ENDPOINT for
-    /// sandboxes. The host is resolved from the sandbox's own LXD bridge
-    /// network at create time.
+    /// sandboxes when --gateway-endpoint is unset. The host is then resolved
+    /// from the sandbox's own LXD bridge network at create time.
     #[arg(long, default_value_t = DEFAULT_GATEWAY_GRPC_PORT)]
     pub gateway_grpc_port: u16,
+
+    /// URL sandboxes reach the gateway at (OPENSHELL_ENDPOINT), e.g.
+    /// `http://10.0.0.5:17670`. When unset, it is the host-side address of the
+    /// sandbox's network plus --gateway-grpc-port, which only reaches a gateway
+    /// listening on that bridge. Set it when the gateway runs anywhere else —
+    /// in an instance, on another machine — and on OVN networks, whose
+    /// address belongs to their virtual router.
+    #[arg(long, value_parser = parse_gateway_endpoint)]
+    pub gateway_endpoint: Option<String>,
 
     /// Set `security.nesting` on sandboxes, for workloads that run containers
     /// themselves. The supervisor does not need it: its network namespace,
@@ -222,6 +231,30 @@ pub struct Config {
     /// failing the RPC with DeadlineExceeded.
     #[arg(long, default_value_t = DEFAULT_OPERATION_TIMEOUT_SECS)]
     pub operation_timeout_secs: u64,
+}
+
+/// Validates `--gateway-endpoint`: an `http` or `https` URL naming a host and
+/// nothing past the port, which is all the supervisor uses. Returns it
+/// normalized (lowercase scheme and host, no surrounding whitespace) and
+/// without a trailing slash.
+fn parse_gateway_endpoint(value: &str) -> Result<String, String> {
+    let url = url::Url::parse(value).map_err(|e| format!("not a URL: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "scheme must be http or https, not {:?}",
+            url.scheme()
+        ));
+    }
+    if !url.host_str().is_some_and(|host| !host.is_empty()) {
+        return Err("the URL names no host".to_string());
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err("the URL must not have a path, query or fragment".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("the URL must not carry credentials".to_string());
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
 #[cfg(test)]
@@ -248,6 +281,7 @@ mod tests {
         assert!(config.supervisor_bin.is_none());
         assert!(config.lxd_url.is_none());
         assert_eq!(config.gateway_grpc_port, DEFAULT_GATEWAY_GRPC_PORT);
+        assert!(config.gateway_endpoint.is_none());
     }
 
     /// A graceful stop always runs to its deadline (the supervisor ignores
@@ -300,6 +334,41 @@ mod tests {
         ])
         .expect("url with cert and key should parse");
         assert_eq!(complete.lxd_url.as_deref(), Some("https://10.0.0.1:8443"));
+    }
+
+    #[test]
+    fn gateway_endpoint_is_an_http_or_https_url() {
+        for (value, expected) in [
+            ("http://10.0.0.5:17670", "http://10.0.0.5:17670"),
+            (
+                "https://gateway.example:17670/",
+                "https://gateway.example:17670",
+            ),
+            ("https://[fd42::5]:17670", "https://[fd42::5]:17670"),
+            (
+                " HTTPS://Gateway.Example:17670/ ",
+                "https://gateway.example:17670",
+            ),
+        ] {
+            let config =
+                Config::try_parse_from(["openshell-driver-lxd", "--gateway-endpoint", value])
+                    .unwrap_or_else(|e| panic!("{value}: {e}"));
+            assert_eq!(config.gateway_endpoint.as_deref(), Some(expected));
+        }
+
+        for value in [
+            "10.0.0.5:17670",
+            "grpc://10.0.0.5:17670",
+            "http://10.0.0.5:17670/api",
+            "http://user:secret@10.0.0.5:17670",
+            "file:///tmp/sock",
+        ] {
+            assert!(
+                Config::try_parse_from(["openshell-driver-lxd", "--gateway-endpoint", value])
+                    .is_err(),
+                "{value} should be rejected"
+            );
+        }
     }
 
     #[test]

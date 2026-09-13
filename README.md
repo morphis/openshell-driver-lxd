@@ -196,6 +196,18 @@ A create naming a network or pool that does not exist in the driver's
 project fails straight away with `FailedPrecondition`, before any image is
 imported.
 
+### Reaching the gateway
+
+Each sandbox's supervisor connects back to the gateway at
+`OPENSHELL_ENDPOINT`. By default the driver derives it from the host-side
+address of the sandbox's network and `--gateway-grpc-port`, which suits a
+gateway listening on an LXD bridge on the same machine. Anywhere else — a
+gateway in an instance or on another machine, or sandboxes on an OVN network,
+whose address belongs to its virtual router — set it explicitly with
+`--gateway-endpoint` (for example `https://10.131.189.2:17670`). A sandbox on
+an OVN network without `--gateway-endpoint` is refused with
+`FailedPrecondition` rather than pointed at the router.
+
 ## Images and Caching
 
 The driver supports per-sandbox OCI images specified via `template.image` in the

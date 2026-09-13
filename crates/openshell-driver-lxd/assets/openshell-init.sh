@@ -35,33 +35,14 @@ if [ ! -d /sandbox ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Fix /etc/resolv.conf.
+# 3. Drop a dangling /etc/resolv.conf.
 #
 #    Ubuntu and Debian images often ship /etc/resolv.conf as a symlink to
 #    systemd-resolved's stub, which doesn't exist when systemd is not PID 1.
-#    Replace with a static file before any DNS is needed. Use the host IP
-#    (from OPENSHELL_ENDPOINT) or default gateway as the nameserver since
-#    LXD's dnsmasq provides DNS for the container network.
+#    Remove it; a nameserver is written once DHCP has configured eth0.
 # ---------------------------------------------------------------------------
-if [ -L /etc/resolv.conf ] || ! [ -s /etc/resolv.conf ]; then
+if [ -L /etc/resolv.conf ]; then
     rm -f /etc/resolv.conf
-    _ns=""
-    if [ -n "${OPENSHELL_ENDPOINT:-}" ]; then
-        _ep="${OPENSHELL_ENDPOINT#http://}"
-        _ep="${_ep#https://}"
-        _ns="${_ep%%/*}"
-        _ns="${_ns%%:*}"
-    fi
-    if [ -n "$_ns" ]; then
-        printf 'nameserver %s\n' "$_ns" > /etc/resolv.conf
-    else
-        _gw=$(ip route show default 2>/dev/null | awk '/^default/ { print $3; exit }') || true
-        if [ -n "${_gw:-}" ]; then
-            printf 'nameserver %s\n' "$_gw" > /etc/resolv.conf
-        else
-            printf 'nameserver 8.8.8.8\n' > /etc/resolv.conf
-        fi
-    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -109,7 +90,10 @@ if [ -n "$_eth0_addr" ]; then
     ts "eth0 acquired IPv4: ${_eth0_addr}"
 fi
 
-# Ensure resolv.conf has a nameserver if it was empty earlier
+# The DHCP client writes the name servers the network offers. Only if none
+# were written, point resolv.conf at the network's gateway, which serves DNS on
+# an LXD bridge (dnsmasq) though not on OVN. The gateway endpoint is not used:
+# OpenShell's gateway may run anywhere and serves no DNS.
 if [ ! -s /etc/resolv.conf ]; then
     _gw=$(ip route show default 2>/dev/null | awk '/^default/ { print $3; exit }') || true
     if [ -n "${_gw:-}" ]; then
@@ -135,20 +119,46 @@ if [ -f /srv/openshell-env.sh ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Seed /etc/hosts with host.openshell.internal → the host-side IP.
+# 7. Seed /etc/hosts with host.openshell.internal → the gateway's address.
+#
+#    The endpoint's host may be an IPv4 address, a bracketed IPv6 address or
+#    a name; /etc/hosts needs an address, so a name is resolved first.
 # ---------------------------------------------------------------------------
+endpoint_host() {
+    _ep="${OPENSHELL_ENDPOINT#*://}"
+    _ep="${_ep%%/*}"
+    case "$_ep" in
+        \[*\]*)
+            _ep="${_ep#\[}"
+            printf '%s\n' "${_ep%%\]*}"
+            ;;
+        *)
+            printf '%s\n' "${_ep%%:*}"
+            ;;
+    esac
+}
+
+is_ip_address() {
+    case "$1" in
+        "") return 1 ;;
+        *:*) return 0 ;;
+        *[!0-9.]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 OPENSHELL_HOST_IP=""
 if [ -n "${OPENSHELL_ENDPOINT:-}" ]; then
-    _ep="${OPENSHELL_ENDPOINT#http://}"
-    _ep="${_ep#https://}"
-    _host="${_ep%%/*}"
-    _host="${_host%%:*}"
-    if [ -n "$_host" ]; then
+    _host=$(endpoint_host)
+    if is_ip_address "$_host"; then
         OPENSHELL_HOST_IP="$_host"
+    elif [ -n "$_host" ]; then
+        OPENSHELL_HOST_IP=$(getent hosts "$_host" 2>/dev/null | awk '{ print $1; exit }') || true
+        if [ -z "$OPENSHELL_HOST_IP" ]; then
+            ts "WARN: cannot resolve gateway host ${_host}; host.openshell.internal not seeded"
+        fi
     fi
-fi
-
-if [ -z "$OPENSHELL_HOST_IP" ]; then
+else
     OPENSHELL_HOST_IP=$(ip route show default 2>/dev/null \
         | awk '/^default/ { print $3; exit }') || true
 fi
@@ -159,7 +169,7 @@ if [ -n "$OPENSHELL_HOST_IP" ]; then
         "host.openshell.internal host.containers.internal host.docker.internal" \
         >> /etc/hosts
     ts "seeded /etc/hosts: host.openshell.internal → ${OPENSHELL_HOST_IP}"
-else
+elif [ -z "${OPENSHELL_ENDPOINT:-}" ]; then
     ts "WARN: could not determine host IP; host.openshell.internal not seeded"
 fi
 
@@ -174,7 +184,7 @@ if [ -n "${OPENSHELL_ENDPOINT:-}" ] && command -v curl >/dev/null 2>&1; then
         _probe_result="reachable"
     elif [ -n "$OPENSHELL_HOST_IP" ] && \
          curl --silent --max-time 5 --output /dev/null \
-              "http://${OPENSHELL_HOST_IP}/" 2>/dev/null; then
+              "http://$(case "$OPENSHELL_HOST_IP" in *:*) printf '[%s]' "$OPENSHELL_HOST_IP" ;; *) printf '%s' "$OPENSHELL_HOST_IP" ;; esac)/" 2>/dev/null; then
         _probe_result="reachable (fallback)"
     fi
     ts "OPENSHELL_ENDPOINT probe: ${_probe_result} (${OPENSHELL_ENDPOINT})"

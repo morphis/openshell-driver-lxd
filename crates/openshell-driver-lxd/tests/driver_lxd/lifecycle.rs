@@ -417,6 +417,95 @@ async fn unmanaged_instance_is_treated_as_not_found() {
     );
 }
 
+/// With `--gateway-endpoint` sandboxes get that URL rather than one derived
+/// from their network, so a gateway that does not listen on the bridge — in
+/// an instance, or behind an OVN network — is reachable.
+#[tokio::test]
+async fn explicit_gateway_endpoint_reaches_the_instance() {
+    let endpoint = "http://192.0.2.10:17670";
+    let driver = Driver::start_with(DriverOptions {
+        extra_args: vec!["--gateway-endpoint".into(), endpoint.into()],
+        ..Default::default()
+    })
+    .await;
+    let name = unique_name("endpoint");
+    let _cleanup = driver.cleanup(&[&name]);
+
+    driver
+        .create(sandbox(&name))
+        .await
+        .expect("create_sandbox should succeed");
+
+    let config = lxd()
+        .get_instance(&name)
+        .await
+        .expect("raw get_instance")
+        .config;
+    assert_eq!(
+        config
+            .get("environment.OPENSHELL_ENDPOINT")
+            .map(String::as_str),
+        Some(endpoint)
+    );
+}
+
+/// The init script points `host.openshell.internal` at the gateway endpoint's
+/// address, whether the endpoint names an IPv6 address or a host, and seeds
+/// nothing for a host it cannot resolve rather than writing a name where
+/// `/etc/hosts` needs an address.
+#[tokio::test]
+async fn host_alias_follows_the_gateway_endpoint() {
+    for (endpoint, expected) in [
+        ("http://[fd42::5]:17670", Some(vec!["fd42::5"])),
+        ("http://localhost:17670", Some(vec!["127.0.0.1", "::1"])),
+        ("http://gateway.invalid:17670", None),
+    ] {
+        let driver = Driver::start_with(DriverOptions {
+            extra_args: vec!["--gateway-endpoint".into(), endpoint.into()],
+            ..Default::default()
+        })
+        .await;
+        let name = unique_name("alias");
+        let _cleanup = driver.cleanup(&[&name]);
+        driver.create_running(&name).await;
+
+        // The init script logs the outcome before handing over to the
+        // supervisor.
+        let log = eventually(Duration::from_secs(60), "the init script", || async {
+            let log = driver.console_log(&name);
+            (log.contains("seeded /etc/hosts") || log.contains("not seeded")).then_some(log)
+        })
+        .await;
+        let (hosts, _) = lxd()
+            .get_file_from_instance(&name, "/etc/hosts")
+            .await
+            .expect("read /etc/hosts");
+        let alias = String::from_utf8_lossy(&hosts)
+            .lines()
+            .find(|line| line.contains("host.openshell.internal"))
+            .map(|line| {
+                line.split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            });
+
+        match expected {
+            Some(addresses) => assert!(
+                alias.as_deref().is_some_and(|a| addresses.contains(&a)),
+                "{endpoint}: alias {alias:?}, expected one of {addresses:?}; console:\n{log}"
+            ),
+            None => {
+                assert_eq!(alias, None, "{endpoint}: console:\n{log}");
+                assert!(
+                    log.contains("cannot resolve gateway host"),
+                    "{endpoint}: {log}"
+                );
+            }
+        }
+    }
+}
+
 /// A rejected create must not leave anything behind in LXD.
 #[tokio::test]
 async fn invalid_creates_are_rejected_without_leftovers() {
