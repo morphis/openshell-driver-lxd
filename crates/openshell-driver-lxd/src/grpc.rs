@@ -95,8 +95,9 @@ impl ComputeDriver for ComputeDriverService {
         Ok(Response::new(self.driver.capabilities()))
     }
 
-    /// Sandboxes reach the gateway at the address the operator binds it to
-    /// (the LXD bridge), so no additional listener is needed.
+    /// Asks the gateway for a sandbox-callback listener when one is
+    /// configured (`--gateway-callback-listener`); otherwise sandboxes use the
+    /// gateway's main listener and nothing extra is needed.
     ///
     /// Answering rather than leaving the RPC unimplemented matters: the
     /// gateway calls it at startup and aborts on any error other than
@@ -105,9 +106,9 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         _request: Request<GetGatewayListenerRequirementsRequest>,
     ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
-        Ok(Response::new(
-            GetGatewayListenerRequirementsResponse::default(),
-        ))
+        Ok(Response::new(GetGatewayListenerRequirementsResponse {
+            requirements: self.driver.gateway_listener_requirements(),
+        }))
     }
 
     async fn start_sandbox(
@@ -394,9 +395,9 @@ mod tests {
     }
 
     /// The gateway calls this at startup and aborts on any error but
-    /// `Unimplemented`; the driver needs no extra listeners.
+    /// `Unimplemented`; without a callback listener the driver needs none.
     #[tokio::test]
-    async fn gateway_listener_requirements_are_empty() {
+    async fn gateway_listener_requirements_are_empty_by_default() {
         let response = service()
             .get_gateway_listener_requirements(Request::new(
                 GetGatewayListenerRequirementsRequest {},
@@ -405,6 +406,33 @@ mod tests {
             .expect("listener requirements should be answered")
             .into_inner();
         assert!(response.requirements.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gateway_listener_requirements_carry_the_callback_listener() {
+        use computev1::pb::gateway_listener_requirement::Selector;
+
+        let config = Config::parse_from([
+            "openshell-driver-lxd",
+            "--gateway-callback-listener",
+            "169.254.17.1:17670",
+        ]);
+        let lxd =
+            LxdClient::new(LxdEndpoint::UnixSocket("/nonexistent/lxd.socket".into())).unwrap();
+        let response = ComputeDriverService::without_watcher(LxdComputeDriver::new(config, lxd))
+            .get_gateway_listener_requirements(Request::new(
+                GetGatewayListenerRequirementsRequest {},
+            ))
+            .await
+            .expect("listener requirements should be answered")
+            .into_inner();
+
+        assert_eq!(response.requirements.len(), 1);
+        assert_eq!(
+            response.requirements[0].selector,
+            Some(Selector::ExactBindAddress("169.254.17.1:17670".to_string()))
+        );
+        assert!(!response.requirements[0].reason.is_empty());
     }
 
     #[tokio::test]

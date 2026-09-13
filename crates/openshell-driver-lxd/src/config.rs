@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -226,6 +227,19 @@ pub struct Config {
     #[arg(long, value_parser = parse_gateway_endpoint)]
     pub gateway_endpoint: Option<String>,
 
+    /// Address the gateway should additionally listen on for sandbox
+    /// callbacks, e.g. `169.254.17.1:17670`. The driver hands it to the
+    /// gateway as a listener requirement, and the gateway binds it accepting
+    /// only the methods a sandbox may call. It filters by method, not by
+    /// caller: a client certificate the gateway trusts is still a user there
+    /// for the methods users may call too (OpenShell v0.0.116:
+    /// `GetSandboxConfig`, `UpdateConfig`, `GetDraftPolicy`). The port must be
+    /// the gateway's own port and the address one its main listener does not
+    /// already cover. Point --gateway-endpoint at it, directly or through
+    /// forwarding.
+    #[arg(long, value_parser = parse_callback_listener)]
+    pub gateway_callback_listener: Option<SocketAddr>,
+
     /// Set `security.nesting` on sandboxes, for workloads that run containers
     /// themselves. The supervisor does not need it: its network namespace,
     /// nftables rules and seccomp filter work without. Nesting relaxes the
@@ -352,6 +366,21 @@ fn parse_tls_server_name(value: &str) -> Result<String, String> {
     } else {
         Err(format!("{value:?} is not a DNS name or an IP address"))
     }
+}
+
+/// Validates `--gateway-callback-listener`: a concrete address and port, which
+/// is all the gateway accepts for a driver-requested listener.
+fn parse_callback_listener(value: &str) -> Result<SocketAddr, String> {
+    let address: SocketAddr = value
+        .parse()
+        .map_err(|e| format!("not an IP:port address: {e}"))?;
+    if address.ip().is_unspecified() || address.ip().is_multicast() {
+        return Err(format!("{} is not a single unicast address", address.ip()));
+    }
+    if address.port() == 0 {
+        return Err("the port must not be 0".to_string());
+    }
+    Ok(address)
 }
 
 /// Validates `--gateway-endpoint`: an `http` or `https` URL naming a host and
@@ -592,6 +621,26 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(plaintext_http.validate(), Ok(()));
+    }
+
+    #[test]
+    fn callback_listener_is_a_concrete_address() {
+        let config = parse(&["--gateway-callback-listener", "169.254.17.1:17670"]).unwrap();
+        assert_eq!(
+            config.gateway_callback_listener,
+            Some("169.254.17.1:17670".parse().unwrap())
+        );
+        for value in [
+            "0.0.0.0:17670",
+            "169.254.17.1",
+            "169.254.17.1:0",
+            "[ff02::1]:17670",
+        ] {
+            assert!(
+                parse(&["--gateway-callback-listener", value]).is_err(),
+                "{value} should be rejected"
+            );
+        }
     }
 
     #[test]

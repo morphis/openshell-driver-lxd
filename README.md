@@ -166,9 +166,16 @@ gateway so you can create a sandbox end-to-end.
   upstream's Docker driver, the certificate and key passed with
   `--guest-tls-cert`/`--guest-tls-key` are copied into each sandbox (mode
   `0400`, owned by root, for the supervisor). The gateway identifies a
-  sandbox by its sandbox token, not its certificate, and a gateway with
-  mTLS authentication accepts that certificate as a client, so root inside a
-  sandbox holds a credential the gateway trusts.
+  sandbox by its sandbox token, not its certificate, and a gateway with mTLS
+  authentication accepts that certificate as a user, whatever role its
+  subject names (roles are only checked with OIDC). Root inside a sandbox can
+  therefore act as a gateway user. A callback listener
+  (`--gateway-callback-listener`) that sandboxes are kept to narrows that to
+  the methods both sandboxes and users may call, but does not close it: on
+  OpenShell v0.0.116, a sandbox with only the certificate could read another
+  sandbox's config and draft policy (`GetSandboxConfig`, `GetDraftPolicy`)
+  and got past authorization on `UpdateConfig`. Closing it needs the gateway
+  to refuse certificate-only callers on callback listeners.
 - **No default-deny egress or sandbox-to-sandbox network isolation.**
   Sandboxes can reach each other and the network freely today. `lxd-client`
   has the Network ACL APIs needed to build this, but nothing in the driver
@@ -246,6 +253,18 @@ an OVN network without `--gateway-endpoint` is refused with
 `FailedPrecondition` rather than pointed at the router. When sandboxes reach
 the gateway at an address its certificate does not name, `--gateway-tls-server-name`
 sets the name they verify the certificate against instead.
+
+Every sandbox holds the gateway client certificate (see
+[Security limitations](#security-limitations)), so a sandbox that reaches the
+gateway's main listener can use its whole API. `--gateway-callback-listener
+<ip>:<port>` asks the gateway to also bind that address accepting only the
+methods a sandbox may call (upstream's compute-driver callback listener).
+That filters by method, not by caller, so the certificate still acts as a
+user for the methods users may call too. The port must be the gateway's own,
+and the address one its main listener does not cover — for example a
+link-local address on a dummy interface next to the gateway, reached through
+a DNAT or an LXD network forward. Point `--gateway-endpoint` at it and keep
+sandboxes from reaching the main listener.
 
 ## Images and Caching
 

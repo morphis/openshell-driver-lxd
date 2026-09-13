@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use computev1::pb::{DriverSandbox, GetCapabilitiesResponse};
+use computev1::pb::{
+    gateway_listener_requirement, DriverSandbox, GatewayListenerRequirement,
+    GetCapabilitiesResponse,
+};
 use lxd_client::{LxdClient, LxdError};
 use tokio::sync::Mutex;
 
@@ -104,6 +107,23 @@ impl LxdComputeDriver {
     #[must_use]
     pub fn lxd_client(&self) -> LxdClient {
         self.lxd.clone()
+    }
+
+    /// Listeners the gateway should bind besides its main one: the
+    /// sandbox-callback listener, when configured.
+    #[must_use]
+    pub fn gateway_listener_requirements(&self) -> Vec<GatewayListenerRequirement> {
+        self.config
+            .gateway_callback_listener
+            .map(|address| GatewayListenerRequirement {
+                reason: "sandboxes reach the gateway here; serve sandbox-callable RPCs only"
+                    .to_string(),
+                selector: Some(gateway_listener_requirement::Selector::ExactBindAddress(
+                    address.to_string(),
+                )),
+            })
+            .into_iter()
+            .collect()
     }
 
     /// Report driver capabilities and defaults.
