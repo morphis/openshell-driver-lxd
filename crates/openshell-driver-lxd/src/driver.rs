@@ -113,10 +113,10 @@ impl LxdComputeDriver {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: env!("CARGO_PKG_VERSION").to_string(),
             default_image: self.config.default_image.clone(),
-            // The gateway would stop sandboxes when it shuts down and restart
-            // them with StartSandbox when it comes back, which this driver
-            // does not implement. Sandboxes keep running across gateway
-            // restarts instead.
+            // The gateway would stop every sandbox when it shuts down and
+            // start them again when it comes back. Sandboxes keep running
+            // across gateway restarts instead; StartSandbox is only for
+            // sandboxes that were stopped.
             gateway_manages_lifecycle: false,
         }
     }
@@ -276,20 +276,8 @@ impl LxdComputeDriver {
                 spec.sandbox_token.as_bytes().to_vec(),
             ));
         }
-        if let Some(tls) = self.config.guest_tls() {
-            for (guest_path, host_path) in [
-                (mapping::GUEST_TLS_CA_PATH, tls.ca),
-                (mapping::GUEST_TLS_CERT_PATH, tls.cert),
-                (mapping::GUEST_TLS_KEY_PATH, tls.key),
-            ] {
-                let content = tokio::fs::read(host_path).await.map_err(|e| {
-                    DriverError::FailedPrecondition(format!(
-                        "could not read the sandbox TLS material {}: {e}",
-                        host_path.display()
-                    ))
-                })?;
-                guest_files.push((guest_path, content));
-            }
+        if self.config.guest_tls().is_some() {
+            guest_files.extend(self.read_guest_tls_files().await?);
             mapping::insert_guest_tls_environment(&mut config);
         }
         if self.config.sandbox_nesting {
@@ -421,13 +409,7 @@ impl LxdComputeDriver {
         self.wait_operation(&op.id).await?;
 
         let post_create = async {
-            for (guest_path, content) in &guest_files {
-                // Pushed readable by root only: the supervisor runs as root,
-                // the workload it starts does not.
-                self.lxd
-                    .push_file_into_instance(&sandbox.name, guest_path, content)
-                    .await?;
-            }
+            self.push_guest_files(&sandbox.name, &guest_files).await?;
 
             let op = self.lxd.start_instance(&sandbox.name).await?;
             self.wait_operation(&op.id).await?;
@@ -470,14 +452,92 @@ impl LxdComputeDriver {
             .clone()
     }
 
+    /// Reads the configured sandbox TLS materials, paired with the paths they
+    /// go to in the sandbox. Read on every use, so rotated files reach the
+    /// next sandbox that is created or started.
+    async fn read_guest_tls_files(&self) -> Result<Vec<(&'static str, Vec<u8>)>, DriverError> {
+        let Some(tls) = self.config.guest_tls() else {
+            return Ok(Vec::new());
+        };
+        let mut files = Vec::with_capacity(3);
+        for (guest_path, host_path) in [
+            (mapping::GUEST_TLS_CA_PATH, tls.ca),
+            (mapping::GUEST_TLS_CERT_PATH, tls.cert),
+            (mapping::GUEST_TLS_KEY_PATH, tls.key),
+        ] {
+            let content = tokio::fs::read(host_path).await.map_err(|e| {
+                DriverError::FailedPrecondition(format!(
+                    "could not read the sandbox TLS material {}: {e}",
+                    host_path.display()
+                ))
+            })?;
+            files.push((guest_path, content));
+        }
+        Ok(files)
+    }
+
+    /// Pushes files into a stopped sandbox, readable by root only: the
+    /// supervisor runs as root, the workload it starts does not.
+    async fn push_guest_files(
+        &self,
+        name: &str,
+        files: &[(&str, Vec<u8>)],
+    ) -> Result<(), DriverError> {
+        for (guest_path, content) in files {
+            self.lxd
+                .push_file_into_instance(name, guest_path, content)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Starts a stopped sandbox again, idempotently.
+    ///
+    /// The instance keeps its token and configuration across a stop; the TLS
+    /// materials are pushed again so a restarted sandbox gets the current
+    /// ones. The stop marker is cleared first, so a sandbox that later exits
+    /// by itself is reported as `ContainerExited` rather than as stopped on
+    /// request.
+    pub async fn start_sandbox(&self, name: &str) -> Result<(), DriverError> {
+        let instance = self.get_managed_instance(name).await?;
+        // Settling re-reads the instance; the id tells a restart of this
+        // sandbox from one that reused the name in the meantime.
+        let sandbox_id = instance
+            .config
+            .get(mapping::KEY_SANDBOX_ID)
+            .cloned()
+            .unwrap_or_default();
+        match instance.status.as_str() {
+            "Stopped" => {}
+            // Already up, or on its way there.
+            "Running" | "Ready" | "Starting" => return Ok(()),
+            // Anything else — paused, stopping, broken — would not be running
+            // after an "OK" here.
+            other => {
+                return Err(DriverError::FailedPrecondition(format!(
+                "sandbox instance is {other}, not stopped; it can be started once it has stopped"
+            )))
+            }
+        }
+
+        let tls_files = self.read_guest_tls_files().await?;
+        self.push_guest_files(name, &tls_files).await?;
+
+        let mut config = HashMap::new();
+        config.insert(mapping::KEY_STOP_INTENT.to_string(), None);
+        self.lxd.patch_instance_config(name, config).await?;
+
+        let op = self.lxd.start_instance(name).await?;
+        self.wait_operation(&op.id).await?;
+        self.settle_after_start(name, &sandbox_id).await
+    }
+
     /// Records that the driver stopped this sandbox deliberately (see
     /// [`mapping::KEY_STOP_INTENT`]).
     ///
     /// Best-effort: the marker only refines the reason reported for a stopped
-    /// sandbox, so failing to write it must not fail the stop itself. Nothing
-    /// clears it because this driver exposes no start RPC — a stopped sandbox
-    /// is only ever deleted. A future `StartSandbox` would need to clear it so
-    /// a later crash is not reported as a deliberate stop.
+    /// sandbox, so failing to write it must not fail the stop itself.
+    /// [`Self::start_sandbox`] clears it.
     async fn set_stop_intent(&self, name: &str) {
         let mut config = HashMap::new();
         config.insert(

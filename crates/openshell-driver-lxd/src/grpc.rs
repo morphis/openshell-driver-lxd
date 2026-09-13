@@ -110,13 +110,14 @@ impl ComputeDriver for ComputeDriverService {
         ))
     }
 
-    /// Restarting a stopped sandbox is not supported yet, which is also why
-    /// the driver does not ask the gateway to manage sandbox lifecycle.
     async fn start_sandbox(
         &self,
-        _request: Request<StartSandboxRequest>,
+        request: Request<StartSandboxRequest>,
     ) -> Result<Response<StartSandboxResponse>, Status> {
-        Err(DriverError::Unimplemented("StartSandbox is not supported by the LXD driver").into())
+        let req = request.into_inner();
+        let name = resolve_name(&self.driver, &req.sandbox_name, &req.sandbox_id).await?;
+        self.driver.start_sandbox(&name).await?;
+        Ok(Response::new(StartSandboxResponse {}))
     }
 
     /// Workspaces own no LXD resources of their own: every sandbox lives in
@@ -404,18 +405,6 @@ mod tests {
             .expect("listener requirements should be answered")
             .into_inner();
         assert!(response.requirements.is_empty());
-    }
-
-    #[tokio::test]
-    async fn start_sandbox_is_unimplemented() {
-        let status = service()
-            .start_sandbox(Request::new(StartSandboxRequest {
-                sandbox_id: "id".to_string(),
-                sandbox_name: "name".to_string(),
-            }))
-            .await
-            .expect_err("StartSandbox is not supported");
-        assert_eq!(status.code(), Code::Unimplemented);
     }
 
     #[tokio::test]

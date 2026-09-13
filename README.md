@@ -2,7 +2,7 @@
 
 OpenShell Compute driver for LXD
 
-**Status:** Early development. The core sandbox lifecycle (create/get/list/stop/delete,
+**Status:** Early development. The core sandbox lifecycle (create/get/list/stop/start/delete,
 token delivery, exec) works end-to-end against a real OpenShell gateway. A
 number of features are not yet implemented — see
 [Known limitations](#known-limitations) below.
@@ -326,7 +326,9 @@ the gateway restarts:
 LXD reports the same `Stopped` status however an instance went down, so the
 driver records `user.openshell.stop_intent` on the instance when it is asked
 to stop one. Without it a user-requested stop is indistinguishable from a
-crash and surfaces as `Error` instead of `Stopped`.
+crash and surfaces as `Error` instead of `Stopped`. Starting the sandbox again
+(`openshell sandbox start`) clears the marker and pushes the current TLS
+materials before the instance starts.
 
 Note that the supervisor does not act on LXD's shutdown signal, so a graceful
 stop never completes on its own. `stop_sandbox` bounds the graceful attempt

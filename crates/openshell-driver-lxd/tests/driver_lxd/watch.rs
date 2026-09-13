@@ -30,6 +30,63 @@ async fn requested_stop_is_pushed_as_container_stopped() {
         .await;
 }
 
+/// A stopped sandbox starts again and reads as ready; the stop is forgotten,
+/// so a supervisor that exits afterwards reads as exited, not as stopped on
+/// request.
+#[tokio::test]
+async fn started_sandbox_is_ready_and_forgets_the_stop() {
+    let driver = Driver::start().await;
+    let name = unique_name("wstart");
+    let id = sandbox_id(&name);
+    let _cleanup = driver.cleanup(&[&name]);
+    let mut watch = driver.watch().await;
+
+    driver.create_running(&name).await;
+    watch.expect_snapshot(&id, "True", "").await;
+    // Starting a running sandbox changes nothing.
+    driver
+        .start_sandbox(&name)
+        .await
+        .expect("start_sandbox on a running sandbox should succeed");
+
+    driver
+        .stop(&name)
+        .await
+        .expect("stop_sandbox should succeed");
+    watch
+        .expect_snapshot(&id, "False", "ContainerStopped")
+        .await;
+
+    driver
+        .start_sandbox(&name)
+        .await
+        .expect("start_sandbox should succeed");
+    watch.expect_snapshot(&id, "True", "").await;
+
+    driver.exit_supervisor(&name, 0).await;
+    watch.expect_snapshot(&id, "False", "ContainerExited").await;
+}
+
+/// Starting a paused sandbox cannot make it run, so it is refused rather
+/// than reported as started.
+#[tokio::test]
+async fn starting_a_paused_sandbox_is_refused() {
+    let driver = Driver::start().await;
+    let name = unique_name("wpaused");
+    let _cleanup = driver.cleanup(&[&name]);
+    driver.create_running(&name).await;
+    lxc(&["pause", &name]);
+
+    let status = driver
+        .start_sandbox(&name)
+        .await
+        .expect_err("a paused sandbox cannot be started");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+    assert!(status.message().contains("Frozen"), "{status}");
+
+    lxc(&["start", &name]);
+}
+
 /// The supervisor exiting by itself is the case the watcher exists for: LXD
 /// reports `instance-shutdown` and the sandbox must read as exited, not
 /// stopped.

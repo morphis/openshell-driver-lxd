@@ -15,8 +15,8 @@ use computev1::pb::compute_driver_client::ComputeDriverClient;
 use computev1::pb::{
     watch_sandboxes_event, CreateSandboxRequest, DeleteSandboxRequest, DriverCondition,
     DriverSandbox, DriverSandboxSpec, DriverSandboxTemplate, GetCapabilitiesRequest,
-    GetSandboxRequest, ListSandboxesRequest, StopSandboxRequest, WatchSandboxesEvent,
-    WatchSandboxesRequest,
+    GetSandboxRequest, ListSandboxesRequest, StartSandboxRequest, StopSandboxRequest,
+    WatchSandboxesEvent, WatchSandboxesRequest,
 };
 use hyper_util::rt::TokioIo;
 use lxd_client::{LxdClient, LxdEndpoint, DEFAULT_PROJECT};
@@ -553,6 +553,17 @@ impl Driver {
             .await
             .stop_sandbox(Request::new(StopSandboxRequest {
                 sandbox_id: id.to_string(),
+                sandbox_name: name.to_string(),
+            }))
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn start_sandbox(&self, name: &str) -> Result<(), Status> {
+        self.client()
+            .await
+            .start_sandbox(Request::new(StartSandboxRequest {
+                sandbox_id: String::new(),
                 sandbox_name: name.to_string(),
             }))
             .await
