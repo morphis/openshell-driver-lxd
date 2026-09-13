@@ -277,6 +277,14 @@ impl LxdComputeDriver {
 
         let has_token = !spec.sandbox_token.is_empty();
         let gateway_endpoint = self.resolve_gateway_endpoint(placement.network, &network)?;
+        let egress_acl = if self.config.restrict_sandbox_egress {
+            Some(
+                self.ensure_egress_acl(placement.network, &network, &gateway_endpoint)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let mut config = mapping::build_create_config(
             sandbox,
             spec,
@@ -402,6 +410,7 @@ impl LxdComputeDriver {
 
         let devices = mapping::build_create_devices(
             placement,
+            egress_acl.as_deref(),
             gpu.is_some(),
             aux_pool,
             &volume_name,
@@ -673,6 +682,58 @@ impl LxdComputeDriver {
             )));
         }
         Ok(network)
+    }
+
+    /// Brings the egress ACL for sandboxes on `network_name` up to date and
+    /// returns its name (see [`crate::egress`]).
+    ///
+    /// Done on every create, before anything slow, so a changed gateway
+    /// endpoint reaches the ACL; an ACL that is already right is not
+    /// rewritten.
+    async fn ensure_egress_acl(
+        &self,
+        network_name: &str,
+        network: &lxd_client::Network,
+        gateway_endpoint: &str,
+    ) -> Result<String, DriverError> {
+        if network.type_ != "ovn" {
+            return Err(DriverError::FailedPrecondition(format!(
+                "--restrict-sandbox-egress needs sandboxes on an OVN network, where LXD applies \
+                 ACLs to each NIC; {network_name:?} is a {} network",
+                network.type_
+            )));
+        }
+
+        let url = url::Url::parse(gateway_endpoint).map_err(|e| {
+            DriverError::FailedPrecondition(format!(
+                "gateway endpoint {gateway_endpoint:?} is not a URL: {e}"
+            ))
+        })?;
+        let port = url.port_or_known_default().unwrap_or(443);
+        let gateway: Vec<std::net::SocketAddr> = match url.host() {
+            Some(url::Host::Ipv4(ip)) => vec![(ip, port).into()],
+            Some(url::Host::Ipv6(ip)) => vec![(ip, port).into()],
+            Some(url::Host::Domain(host)) => tokio::net::lookup_host((host, port))
+                .await
+                .map_err(|e| {
+                    DriverError::FailedPrecondition(format!(
+                        "cannot resolve gateway endpoint host {host:?} for the egress ACL: {e}"
+                    ))
+                })?
+                .collect(),
+            None => Vec::new(),
+        };
+        if gateway.is_empty() {
+            return Err(DriverError::FailedPrecondition(format!(
+                "gateway endpoint {gateway_endpoint:?} names no address for the egress ACL"
+            )));
+        }
+
+        let name = crate::egress::acl_name(network_name);
+        self.lxd
+            .ensure_network_acl(&name, crate::egress::rules(&gateway))
+            .await?;
+        Ok(name)
     }
 
     /// Resolves `OPENSHELL_ENDPOINT`: `--gateway-endpoint` when set, otherwise

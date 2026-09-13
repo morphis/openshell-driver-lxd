@@ -33,7 +33,7 @@ the `openshell` CLI driving them below.
 
 - Rust (stable, see `rust-toolchain.toml`)
 - `protoc` (`apt install protobuf-compiler libprotobuf-dev`) for `computev1`'s proto codegen
-- [LXD](https://github.com/canonical/lxd) with a storage pool and a managed network for sandboxes — `default` and `lxdbr0` unless set with `--default-storage-pool` and `--default-network` (see [Networks and Storage Pools](#networks-and-storage-pools))
+- [LXD](https://github.com/canonical/lxd) with a storage pool and a managed network for sandboxes — `default` and `lxdbr0` unless set with `--default-storage-pool` and `--default-network` (see [Networks and Storage Pools](#networks-and-storage-pools)); an OVN network for `--restrict-sandbox-egress`
 - `skopeo`, `umoci`, and `mksquashfs` (`apt install skopeo umoci squashfs-tools`) — the driver uses these to pull and import sandbox OCI images into LXD on demand
 - `busybox-static` or `udhcpc` (`apt install busybox-static`) — provides the fallback DHCP client for guest containers
 
@@ -170,16 +170,17 @@ gateway so you can create a sandbox end-to-end.
   authentication accepts that certificate as a user, whatever role its
   subject names (roles are only checked with OIDC). Root inside a sandbox can
   therefore act as a gateway user. A callback listener
-  (`--gateway-callback-listener`) that sandboxes are kept to narrows that to
-  the methods both sandboxes and users may call, but does not close it: on
-  OpenShell v0.0.116, a sandbox with only the certificate could read another
-  sandbox's config and draft policy (`GetSandboxConfig`, `GetDraftPolicy`)
-  and got past authorization on `UpdateConfig`. Closing it needs the gateway
-  to refuse certificate-only callers on callback listeners.
-- **No default-deny egress or sandbox-to-sandbox network isolation.**
-  Sandboxes can reach each other and the network freely today. `lxd-client`
-  has the Network ACL APIs needed to build this, but nothing in the driver
-  calls them yet.
+  (`--gateway-callback-listener`) plus `--restrict-sandbox-egress` narrows
+  that to the methods both sandboxes and users may call, but does not close
+  it: on OpenShell v0.0.116, a sandbox with only the certificate could read
+  another sandbox's config and draft policy (`GetSandboxConfig`,
+  `GetDraftPolicy`) and got past authorization on `UpdateConfig`. Closing it
+  needs the gateway to refuse certificate-only callers on callback listeners.
+- **Sandbox network isolation is opt-in.** Inside a sandbox the supervisor
+  forces the workload through its policy proxy, but the sandbox itself can
+  reach other sandboxes, the LXD host and the LAN unless the driver runs with
+  `--restrict-sandbox-egress` on an OVN network (see
+  [Restricting sandbox egress](#restricting-sandbox-egress)).
 - **`--sandbox-nesting` widens the container's trust boundary.** Sandboxes
   are unprivileged and unnested by default. Nesting, for workloads that run
   containers themselves, grants the `userns` capability, relaxes `/proc/sys`
@@ -264,7 +265,40 @@ user for the methods users may call too. The port must be the gateway's own,
 and the address one its main listener does not cover — for example a
 link-local address on a dummy interface next to the gateway, reached through
 a DNAT or an LXD network forward. Point `--gateway-endpoint` at it and keep
-sandboxes from reaching the main listener.
+sandboxes from reaching the main listener, for instance with
+[egress ACLs](#restricting-sandbox-egress).
+
+### Restricting sandbox egress
+
+The supervisor inside each sandbox already forces the workload through its
+policy proxy, like it does for every OpenShell driver. The sandbox container
+as a whole, supervisor included, would still be on an ordinary network, able
+to reach the LAN, the LXD host and other sandboxes. With
+`--restrict-sandbox-egress` the driver puts every sandbox NIC behind an LXD
+network ACL, `openshell-egress-<network>`, that it keeps in its project. The
+ACL allows:
+
+- TCP to the gateway endpoint's address and port, and
+- public internet addresses: every IPv4 address outside the private, shared,
+  loopback, link-local, documentation and reserved ranges, and global
+  unicast IPv6 (`2000::/3`).
+
+Everything else is rejected, and nothing may open a connection to a sandbox.
+LXD evaluates reject rules before allow rules, so the public internet is
+listed as the complement of the non-public ranges rather than as "allow
+everything, reject private ranges", which would also reject a gateway on a
+private address. DNS needs no rule: LXD lets an OVN NIC reach the DNS servers
+its network hands out regardless of ACLs.
+
+"Public" is decided by address alone. The LAN, the LXD host and the gateway's
+main listener are only kept out while they use non-public addresses; on
+public IPv4 or global IPv6 addresses the public-internet rule lets sandboxes
+reach them.
+
+This needs sandboxes on an OVN network, where LXD applies ACLs to individual
+NICs; on a bridge network the create fails with `FailedPrecondition`. The ACL
+is brought up to date on every create, so a changed gateway endpoint reaches
+it, and left untouched when it already matches.
 
 ## Images and Caching
 

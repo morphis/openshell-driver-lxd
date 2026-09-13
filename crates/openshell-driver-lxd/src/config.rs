@@ -248,6 +248,17 @@ pub struct Config {
     #[arg(long)]
     pub sandbox_nesting: bool,
 
+    /// Confine sandbox networking with an LXD network ACL: a sandbox may
+    /// reach the gateway endpoint and public internet addresses (plus the DNS
+    /// servers its network hands out, which LXD always allows), and nothing
+    /// else — no private or otherwise non-public address, so not a LAN, LXD
+    /// host or other sandbox on such addresses — and nothing may connect to
+    /// it. The driver manages one ACL per network, `openshell-egress-<network>`,
+    /// in its project. Needs sandboxes on an OVN network, where LXD applies
+    /// ACLs to individual NICs.
+    #[arg(long)]
+    pub restrict_sandbox_egress: bool,
+
     /// PEM CA certificate sandboxes verify the gateway's certificate against.
     /// Copied into every sandbox, with --guest-tls-cert and --guest-tls-key,
     /// for the supervisor's mutual-TLS connection to the gateway; the

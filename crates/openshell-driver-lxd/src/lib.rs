@@ -3,6 +3,7 @@
 pub mod config;
 pub(crate) mod dhcp_client;
 pub mod driver;
+pub(crate) mod egress;
 pub mod error;
 pub mod grpc;
 pub mod image;

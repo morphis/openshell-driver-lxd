@@ -385,11 +385,13 @@ fn max_processes(template: &DriverSandboxTemplate) -> Option<u32> {
 }
 
 /// Builds the LXD `devices` map for `POST /1.0/instances`: a root disk on
-/// the placement's storage pool, a NIC on its network, a read-only supervisor
-/// disk volume, a read-only DHCP client disk volume, and an optional GPU
-/// device.
+/// the placement's storage pool, a NIC on its network (behind `egress_acl`,
+/// when given, with everything the ACL does not allow rejected both ways), a
+/// read-only supervisor disk volume, a read-only DHCP client disk volume, and
+/// an optional GPU device.
 pub fn build_create_devices(
     placement: Placement<'_>,
+    egress_acl: Option<&str>,
     gpu: bool,
     supervisor_pool: &str,
     supervisor_volume: &str,
@@ -407,6 +409,17 @@ pub fn build_create_devices(
     let mut eth0 = HashMap::new();
     eth0.insert("type".to_string(), "nic".to_string());
     eth0.insert("network".to_string(), placement.network.to_string());
+    if let Some(acl) = egress_acl {
+        eth0.insert("security.acls".to_string(), acl.to_string());
+        eth0.insert(
+            "security.acls.default.egress.action".to_string(),
+            "reject".to_string(),
+        );
+        eth0.insert(
+            "security.acls.default.ingress.action".to_string(),
+            "reject".to_string(),
+        );
+    }
     devices.insert("eth0".to_string(), eth0);
 
     let mut supervisor = HashMap::new();
@@ -528,8 +541,15 @@ mod tests {
 
     #[test]
     fn build_create_devices_omits_gpu_by_default() {
-        let devices =
-            build_create_devices(DEFAULTS, false, "default", "vol1", "default", "dhcp-vol1");
+        let devices = build_create_devices(
+            DEFAULTS,
+            None,
+            false,
+            "default",
+            "vol1",
+            "default",
+            "dhcp-vol1",
+        );
 
         assert!(!devices.contains_key("gpu0"));
         assert!(devices.contains_key("root"));
@@ -540,8 +560,15 @@ mod tests {
 
     #[test]
     fn build_create_devices_attaches_gpu_when_requested() {
-        let devices =
-            build_create_devices(DEFAULTS, true, "default", "vol1", "default", "dhcp-vol1");
+        let devices = build_create_devices(
+            DEFAULTS,
+            None,
+            true,
+            "default",
+            "vol1",
+            "default",
+            "dhcp-vol1",
+        );
 
         let gpu0 = devices.get("gpu0").expect("gpu0 device should be present");
         assert_eq!(gpu0.get("type"), Some(&"gpu".to_string()));
@@ -555,6 +582,7 @@ mod tests {
         let dhcp_vol_name = dhcp_client_volume_name(digest);
         let devices = build_create_devices(
             DEFAULTS,
+            None,
             false,
             "custom-pool",
             &sup_vol_name,
@@ -1447,7 +1475,7 @@ mod tests {
             storage_pool: "fast",
         };
 
-        let devices = build_create_devices(placement, false, "fast", "sup", "fast", "dhcp");
+        let devices = build_create_devices(placement, None, false, "fast", "sup", "fast", "dhcp");
 
         let root = devices.get("root").expect("root device");
         assert_eq!(root.get("pool").map(String::as_str), Some("fast"));
@@ -1455,6 +1483,33 @@ mod tests {
         let eth0 = devices.get("eth0").expect("eth0 device");
         assert_eq!(eth0.get("type").map(String::as_str), Some("nic"));
         assert_eq!(eth0.get("network").map(String::as_str), Some("sandboxbr0"));
+        assert!(!eth0.keys().any(|key| key.starts_with("security.acls")));
+    }
+
+    #[test]
+    fn egress_acl_guards_the_nic_both_ways() {
+        let placement = Placement {
+            network: "sandboxes",
+            storage_pool: "local",
+        };
+        let devices = build_create_devices(
+            placement,
+            Some("openshell-egress-sandboxes"),
+            false,
+            "local",
+            "sup",
+            "local",
+            "dhcp",
+        );
+
+        let eth0 = devices.get("eth0").expect("eth0 device");
+        for (key, value) in [
+            ("security.acls", "openshell-egress-sandboxes"),
+            ("security.acls.default.egress.action", "reject"),
+            ("security.acls.default.ingress.action", "reject"),
+        ] {
+            assert_eq!(eth0.get(key).map(String::as_str), Some(value), "{key}");
+        }
     }
 
     #[test]

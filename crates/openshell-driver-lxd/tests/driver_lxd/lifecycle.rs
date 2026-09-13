@@ -590,6 +590,27 @@ async fn guest_tls_materials_reach_the_instance() {
     }
 }
 
+/// LXD applies ACLs to individual NICs only on OVN networks, so restricting
+/// egress on a bridge is refused up front rather than silently skipped.
+#[tokio::test]
+async fn restricted_egress_refuses_a_bridge_network() {
+    let driver = Driver::start_with(DriverOptions {
+        extra_args: vec!["--restrict-sandbox-egress".into()],
+        ..Default::default()
+    })
+    .await;
+    let name = unique_name("egress");
+    let _cleanup = driver.cleanup(&[&name]);
+
+    let status = driver
+        .create(sandbox(&name))
+        .await
+        .expect_err("a sandbox on lxdbr0 cannot have its egress restricted");
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status}");
+    assert!(status.message().contains("OVN"), "{status}");
+    assert!(lxd().get_instance(&name).await.is_err());
+}
+
 /// A rejected create must not leave anything behind in LXD.
 #[tokio::test]
 async fn invalid_creates_are_rejected_without_leftovers() {
