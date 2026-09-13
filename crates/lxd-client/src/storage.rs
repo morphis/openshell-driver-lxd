@@ -10,9 +10,62 @@ use urlencoding::encode;
 
 use crate::client::LxdClient;
 use crate::error::LxdError;
-use crate::types::Operation;
+use crate::types::{Operation, StorageVolume};
 
 impl LxdClient {
+    /// `GET /1.0/storage-pools`: the names of the storage pools.
+    pub async fn list_storage_pools(&self) -> Result<Vec<String>, LxdError> {
+        let paths = self
+            .get::<Vec<String>>("/1.0/storage-pools")
+            .await?
+            .into_metadata()?;
+        Ok(paths
+            .iter()
+            .filter_map(|path| path.rsplit('/').next())
+            .map(|name| {
+                urlencoding::decode(name).map_or_else(|_| name.to_string(), |n| n.into_owned())
+            })
+            .collect())
+    }
+
+    /// The project's custom volumes on `pool`, with what uses them and, on a
+    /// cluster, the member each lives on.
+    pub async fn list_custom_volumes(&self, pool: &str) -> Result<Vec<StorageVolume>, LxdError> {
+        self.get::<Vec<StorageVolume>>(&format!(
+            "/1.0/storage-pools/{}/volumes/custom?recursion=1",
+            encode(pool)
+        ))
+        .await?
+        .into_metadata()
+    }
+
+    /// Deletes a custom volume, on cluster member `location` when the pool
+    /// keeps a volume per member (empty `location` otherwise), and waits for
+    /// the deletion to finish.
+    pub async fn delete_custom_volume(
+        &self,
+        pool: &str,
+        name: &str,
+        location: &str,
+    ) -> Result<(), LxdError> {
+        let mut path = format!(
+            "/1.0/storage-pools/{}/volumes/custom/{}",
+            encode(pool),
+            encode(name)
+        );
+        if !location.is_empty() {
+            path.push_str(&format!("?target={}", encode(location)));
+        }
+        let response = self.delete::<serde_json::Value>(&path).await?;
+        // Deleting a custom volume answers synchronously on current LXD; an
+        // asynchronous answer carries the operation to wait on.
+        if response.type_ == "async" {
+            let op: Operation = serde_json::from_value(response.into_metadata()?)?;
+            self.wait_operation(&op.id).await?;
+        }
+        Ok(())
+    }
+
     /// Checks whether a storage pool exists.
     pub async fn storage_pool_exists(&self, pool: &str) -> Result<bool, LxdError> {
         let path = format!("/1.0/storage-pools/{}", encode(pool));

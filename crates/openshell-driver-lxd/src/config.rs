@@ -76,6 +76,10 @@ pub const DEFAULT_OPERATION_TIMEOUT_SECS: u64 = 60;
 /// Default prefix for digest-derived LXD image aliases.
 pub const DEFAULT_IMAGE_CACHE_ALIAS_PREFIX: &str = "openshell-oci-";
 
+/// Default interval, in seconds, between clean-ups of what the driver no
+/// longer uses.
+pub const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 6 * 60 * 60;
+
 /// CLI configuration for `openshell-driver-lxd`.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "openshell-driver-lxd", version, about)]
@@ -171,6 +175,14 @@ pub struct Config {
     /// Deadline, in seconds, for pulling and importing OCI images before failing.
     #[arg(long, default_value_t = DEFAULT_IMAGE_PULL_TIMEOUT_SECS)]
     pub image_pull_timeout_secs: u64,
+    /// Seconds between clean-ups of what the driver no longer uses: images
+    /// from older conversion revisions, unused supervisor and DHCP-client
+    /// volumes, cached supervisor binaries for other digests and abandoned
+    /// scratch directories. The first clean-up runs at start-up. `0` disables
+    /// clean-up, for drivers that share an LXD project with others.
+    #[arg(long, default_value_t = DEFAULT_CLEANUP_INTERVAL_SECS)]
+    pub cleanup_interval_secs: u64,
+
     /// Prefix for digest-derived LXD image aliases.
     #[arg(long, default_value = DEFAULT_IMAGE_CACHE_ALIAS_PREFIX)]
     pub image_cache_alias_prefix: String,

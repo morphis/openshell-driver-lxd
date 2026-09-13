@@ -245,3 +245,119 @@ async fn cold_import_lands_in_a_project_with_its_own_images() {
         project.name
     );
 }
+
+/// Clean-up at start-up removes images from older conversion revisions and
+/// unused auxiliary volumes, and keeps images of the current revision and
+/// volumes that are not the driver's. Runs in its own project, where no
+/// other test's driver is working.
+#[tokio::test]
+async fn cleanup_removes_what_the_driver_no_longer_uses() {
+    let project = Project::create(true);
+    let prefix = format!("{}-", project.name);
+    let digest = "cd".repeat(32);
+    let stale_alias = format!("{prefix}r1-{digest}");
+    let current_alias = format!(
+        "{prefix}r{}-{digest}",
+        openshell_driver_lxd::image::CONVERSION_REVISION
+    );
+    import_tiny_image(&project.name, &stale_alias, "stale");
+    import_tiny_image(&project.name, &current_alias, "current");
+
+    for volume in [
+        "openshell-supervisor-0000",
+        "openshell-dhcp-client-0000",
+        "user-data",
+    ] {
+        lxc(&[
+            "storage",
+            "volume",
+            "create",
+            "default",
+            volume,
+            "--project",
+            &project.name,
+        ]);
+    }
+
+    let driver = Driver::start_with(DriverOptions {
+        project: project.name.clone(),
+        image_cache_alias_prefix: prefix,
+        default_image: "ghcr.io/nvidia/openshell/supervisor:0.0.116".to_string(),
+        cleanup: true,
+        ..Default::default()
+    })
+    .await;
+    eventually(Duration::from_secs(300), "clean-up to finish", || async {
+        driver.log().contains("clean-up finished").then_some(())
+    })
+    .await;
+
+    let volumes = lxc(&[
+        "storage",
+        "volume",
+        "list",
+        "default",
+        "--project",
+        &project.name,
+        "--format",
+        "csv",
+        "-c",
+        "n",
+    ]);
+    assert!(
+        !volumes.contains("-0000"),
+        "unused auxiliary volumes should be gone: {volumes}"
+    );
+    assert!(volumes.contains("user-data"), "{volumes}");
+
+    let images = lxc(&[
+        "image",
+        "list",
+        "--project",
+        &project.name,
+        "--format",
+        "csv",
+        "-c",
+        "l",
+    ]);
+    assert!(!images.contains(&stale_alias), "{images}");
+    assert!(images.contains(&current_alias), "{images}");
+}
+
+/// Imports a minimal image, distinct per `content`, under `alias`.
+fn import_tiny_image(project: &str, alias: &str, content: &str) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let rootfs = dir.path().join("rootfs");
+    std::fs::create_dir_all(&rootfs).unwrap();
+    std::fs::write(rootfs.join("content"), content).unwrap();
+    std::fs::write(
+        dir.path().join("metadata.yaml"),
+        "architecture: x86_64\ncreation_date: 1\n",
+    )
+    .unwrap();
+    let run = |program: &str, args: &[&str]| {
+        let output = std::process::Command::new(program)
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap_or_else(|e| panic!("{program}: {e}"));
+        assert!(output.status.success(), "{program} {args:?}: {output:?}");
+    };
+    run("tar", &["-cJf", "meta.tar.xz", "metadata.yaml"]);
+    run(
+        "mksquashfs",
+        &["rootfs", "rootfs.squashfs", "-noappend", "-quiet"],
+    );
+    let meta = dir.path().join("meta.tar.xz");
+    let squashfs = dir.path().join("rootfs.squashfs");
+    lxc(&[
+        "image",
+        "import",
+        meta.to_str().unwrap(),
+        squashfs.to_str().unwrap(),
+        "--alias",
+        alias,
+        "--project",
+        project,
+    ]);
+}

@@ -278,3 +278,41 @@ pub struct Network {
     #[serde(default)]
     pub config: HashMap<String, String>,
 }
+
+/// An image as listed by `GET /1.0/images?recursion=1`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Image {
+    /// Full SHA-256 fingerprint.
+    pub fingerprint: String,
+    /// Project the image belongs to. A project without its own images lists
+    /// the `default` project's.
+    #[serde(default)]
+    pub project: String,
+    /// Aliases pointing at the image.
+    #[serde(default)]
+    pub aliases: Vec<ImageAlias>,
+}
+
+/// One alias of an [`Image`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImageAlias {
+    pub name: String,
+}
+
+/// A storage volume as listed by
+/// `GET /1.0/storage-pools/<pool>/volumes/<type>?recursion=1`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StorageVolume {
+    pub name: String,
+    /// Project the volume belongs to. A project without its own storage
+    /// volumes lists the `default` project's.
+    #[serde(default)]
+    pub project: String,
+    /// API paths of what uses the volume, e.g. the instances it is attached to.
+    #[serde(default)]
+    pub used_by: Vec<String>,
+    /// Cluster member holding the volume, for pools local to each member;
+    /// empty otherwise.
+    #[serde(default)]
+    pub location: String,
+}

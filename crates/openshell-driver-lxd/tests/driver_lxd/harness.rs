@@ -269,6 +269,10 @@ pub struct DriverOptions {
     /// Passes `--allow-plaintext-gateway`. The stand-in supervisor never
     /// connects to a gateway, so most tests need no TLS materials.
     pub allow_plaintext_gateway: bool,
+    /// Lets the driver clean up (`--cleanup-interval-secs`). Off by default:
+    /// test drivers run in parallel against the same project, and one's
+    /// clean-up could remove a volume another is about to attach.
+    pub cleanup: bool,
     pub extra_args: Vec<String>,
 }
 
@@ -282,6 +286,7 @@ impl Default for DriverOptions {
             image_work_dir: image_work_dir(),
             start_retries: 1,
             allow_plaintext_gateway: true,
+            cleanup: false,
             extra_args: Vec::new(),
         }
     }
@@ -382,6 +387,9 @@ impl Driver {
         }
         if options.allow_plaintext_gateway {
             cmd.arg("--allow-plaintext-gateway");
+        }
+        if !options.cleanup {
+            cmd.args(["--cleanup-interval-secs", "0"]);
         }
         cmd.args(&options.extra_args)
             .stdin(Stdio::null())
@@ -624,6 +632,22 @@ impl Drop for Driver {
                 self.log()
             );
             if let Some(dir) = self.dir.take() {
+                // Keep the log for inspection, not the caches and scratch
+                // next to it, which run to gigabytes and add up over failed
+                // runs. `self.dir` is already taken, so the path comes from
+                // `dir`: panicking here, during a test's unwind, would abort
+                // the whole test binary.
+                let log = dir.path().join("driver.log");
+                for entry in std::fs::read_dir(dir.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    if entry.path() != log {
+                        let _ = std::fs::remove_dir_all(entry.path())
+                            .or_else(|_| std::fs::remove_file(entry.path()));
+                    }
+                }
                 let _ = dir.keep();
             }
         }

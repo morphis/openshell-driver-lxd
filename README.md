@@ -341,6 +341,7 @@ gateway request (e.g. `docker://registry.example.com/org/sandbox:latest` or
   - `--start-retries`: how many times to restart a sandbox whose init exits immediately after the first start (default: 1; `0` disables).
   - `--image-pull-timeout-secs`: timeout for image inspection and pulling (default: 300s).
   - `--image-cache-alias-prefix`: prefix for cached LXD aliases (default: `openshell-oci-`).
+  - `--cleanup-interval-secs`: how often the driver removes what it no longer uses (default: 21600, and once at start-up; `0` disables). It removes images converted by an older conversion revision, supervisor and DHCP-client volumes that no instance uses and that are not the current ones, cached supervisor binaries for other digests, and scratch directories abandoned for over a day. In LXD it only touches its own project's images and volumes, never the `default` project's that a project without its own images or volumes shares. Disable it when several drivers share one LXD project.
   - `--skopeo-path`, `--umoci-path`, `--mksquashfs-path`: optional binary path overrides.
 
 ### Supervisor Binary Delivery via Custom Storage Volume

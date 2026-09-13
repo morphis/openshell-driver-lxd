@@ -368,6 +368,12 @@ impl LxdClient {
         self
     }
 
+    /// The target LXD project.
+    #[must_use]
+    pub fn project(&self) -> &str {
+        &self.project
+    }
+
     /// Appends `project=<name>` to `path`, URL-encoding the project name.
     ///
     /// Uses `?` when the path has no query string and `&` when it already has

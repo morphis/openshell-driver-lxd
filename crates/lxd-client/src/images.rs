@@ -11,9 +11,16 @@ use urlencoding::encode;
 use crate::client::LxdClient;
 use crate::error::LxdError;
 use crate::split_image_body::SplitImageBody;
-use crate::types::Operation;
+use crate::types::{Image, Operation};
 
 impl LxdClient {
+    /// `GET /1.0/images?recursion=1`: the project's images with their aliases.
+    pub async fn list_images(&self) -> Result<Vec<Image>, LxdError> {
+        self.get::<Vec<Image>>("/1.0/images?recursion=1")
+            .await?
+            .into_metadata()
+    }
+
     /// `GET /1.0/images/aliases/<alias>`: true if a local image alias
     /// resolves to an image, false if it doesn't exist.
     pub async fn image_alias_exists(&self, alias: &str) -> Result<bool, LxdError> {

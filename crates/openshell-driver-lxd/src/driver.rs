@@ -11,7 +11,7 @@ use computev1::pb::{
     GetCapabilitiesResponse,
 };
 use lxd_client::{LxdClient, LxdError};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::config::Config;
 use crate::dhcp_client;
@@ -58,6 +58,10 @@ pub struct LxdComputeDriver {
     supervisor_volume_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     dhcp_client_volume_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     lifecycle_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Held shared from provisioning a sandbox's auxiliary volumes until its
+    /// instance uses them, and exclusively by clean-up, which would otherwise
+    /// see those volumes unused and remove them.
+    volume_use: Arc<RwLock<()>>,
 }
 
 impl LxdComputeDriver {
@@ -88,6 +92,7 @@ impl LxdComputeDriver {
             supervisor_volume_locks: Arc::new(Mutex::new(HashMap::new())),
             dhcp_client_volume_locks: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
+            volume_use: Arc::new(RwLock::new(())),
         }
     }
 
@@ -101,6 +106,86 @@ impl LxdComputeDriver {
         self.image_cache
             .resolve_alias(&self.config.default_image)
             .await
+    }
+
+    /// The supervisor binary on the host and its digest, extracting it from
+    /// the supervisor image on first use.
+    async fn resolve_supervisor(&self) -> Result<(std::path::PathBuf, String), DriverError> {
+        match &self.config.supervisor_bin {
+            Some(path) => Ok((path.clone(), digest_of_file(path)?)),
+            None => self
+                .image_cache
+                .extract_supervisor_binary(
+                    &self.config.supervisor_image,
+                    &self.config.supervisor_cache_dir,
+                )
+                .await
+                .map_err(|e| {
+                    DriverError::ImageImport(format!("supervisor binary extraction failed: {e}"))
+                }),
+        }
+    }
+
+    /// Removes images, volumes and host files the driver no longer uses (see
+    /// [`crate::gc`]). Best-effort: failures are logged and retried on the
+    /// next run.
+    pub async fn collect_garbage(&self) {
+        // Without the current supervisor digest nothing supervisor-related
+        // can be told apart from what is in use, so those are left alone.
+        let supervisor_digest = match self.resolve_supervisor().await {
+            Ok((_, digest)) => Some(digest),
+            Err(e) => {
+                tracing::warn!(%e, "could not resolve the supervisor; keeping its volumes and cache");
+                None
+            }
+        };
+
+        // Likewise for the DHCP client: it is resolved from the host, so
+        // without its digest the volume in use cannot be told from a stale one.
+        let dhcp_digest =
+            match dhcp_client::load_dhcp_client(self.config.dhcp_client_bin.as_deref()).await {
+                Ok((_, digest)) => Some(digest),
+                Err(e) => {
+                    tracing::warn!(%e, "could not resolve the DHCP client; keeping its volumes");
+                    None
+                }
+            };
+
+        let volume_use = self.volume_use.write().await;
+        let lxd = match (&supervisor_digest, &dhcp_digest) {
+            (Some(supervisor), Some(dhcp)) => {
+                let keep = vec![
+                    mapping::supervisor_volume_name(supervisor),
+                    mapping::dhcp_client_volume_name(dhcp),
+                ];
+                crate::gc::collect_lxd(&self.lxd, &self.config.image_cache_alias_prefix, &keep)
+                    .await
+            }
+            // Keep every auxiliary volume by treating none as removable.
+            _ => {
+                crate::gc::collect_lxd_images_only(&self.lxd, &self.config.image_cache_alias_prefix)
+                    .await
+            }
+        };
+        drop(volume_use);
+
+        let host_entries = crate::gc::collect_host(
+            &self.config.supervisor_cache_dir,
+            if self.config.supervisor_bin.is_some() {
+                None
+            } else {
+                supervisor_digest.as_deref()
+            },
+            &self.config.image_work_dir,
+            std::time::SystemTime::now(),
+        );
+
+        tracing::debug!(
+            images = lxd.images,
+            volumes = lxd.volumes,
+            host_entries,
+            "clean-up finished"
+        );
     }
 
     /// Clone of the LXD client, for the lifecycle watcher.
@@ -342,20 +427,19 @@ impl LxdComputeDriver {
                 "GpuResourceRequirements.count is ignored in v1; attaching all host GPUs"
             );
         }
-        // Resolve supervisor binary and digest
-        let (binary_path, digest) = match &self.config.supervisor_bin {
-            Some(path) => (path.clone(), digest_of_file(path)?),
-            None => self
-                .image_cache
-                .extract_supervisor_binary(
-                    &self.config.supervisor_image,
-                    &self.config.supervisor_cache_dir,
-                )
-                .await
-                .map_err(|e| {
-                    DriverError::ImageImport(format!("supervisor binary extraction failed: {e}"))
-                })?,
+        let (binary_path, digest) = self.resolve_supervisor().await?;
+
+        // Resolved before the volumes are provisioned: an import can take
+        // minutes, and clean-up waits while volumes are provisioned but unused.
+        let image_alias = if template.image.is_empty() {
+            self.image_cache
+                .resolve_alias(&self.config.default_image)
+                .await?
+        } else {
+            self.image_cache.resolve_alias(&template.image).await?
         };
+
+        let volume_use = self.volume_use.read().await;
 
         // Ensure digest-keyed custom storage volume exists on the aux pool.
         // Locks are keyed by pool *and* digest: the same binary on two pools
@@ -419,14 +503,6 @@ impl LxdComputeDriver {
         );
         let profiles = mapping::build_profiles(template);
 
-        let image_alias = if template.image.is_empty() {
-            self.image_cache
-                .resolve_alias(&self.config.default_image)
-                .await?
-        } else {
-            self.image_cache.resolve_alias(&template.image).await?
-        };
-
         // Create the instance stopped so we can push the token and TLS files
         // before the supervisor starts — avoids a race where the supervisor
         // reads them before they have been written.
@@ -442,6 +518,7 @@ impl LxdComputeDriver {
             )
             .await?;
         self.wait_operation(&op.id).await?;
+        drop(volume_use);
 
         let post_create = async {
             self.push_guest_files(&sandbox.name, &guest_files).await?;
