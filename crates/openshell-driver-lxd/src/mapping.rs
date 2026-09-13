@@ -110,7 +110,54 @@ pub(crate) fn dhcp_client_volume_name(digest: &str) -> String {
 /// Maps an [`Instance`] to a [`DriverSandbox`] observation. `spec` is left
 /// unset, per the proto's own doc comment: "Drivers may omit this in observed
 /// snapshots returned by Get/List/Watch."
+///
+/// For a sandbox found already stopped. Use
+/// [`instance_to_driver_sandbox_live`] when a lifecycle event announced the
+/// stop as it happened.
 pub fn instance_to_driver_sandbox(instance: &Instance) -> DriverSandbox {
+    to_driver_sandbox(instance, StopSeen::Discovered)
+}
+
+/// Maps an [`Instance`] whose stop the driver saw announced by a live LXD
+/// lifecycle event.
+///
+/// Such a stop cannot be LXD going down with the daemon or the host: the
+/// event proves LXD is up to send it. A `volatile.last_state.power` still
+/// recorded as `RUNNING` is then the tail of a stop LXD is finishing, not a
+/// runtime restart (see [`StopSeen`]).
+pub(crate) fn instance_to_driver_sandbox_live(instance: &Instance) -> DriverSandbox {
+    to_driver_sandbox(instance, StopSeen::Live)
+}
+
+/// How the driver learned that a sandbox is stopped, which decides whether
+/// [`CONDITION_RUNTIME_RESTART`] is reachable at all.
+///
+/// LXD clears `volatile.last_state.power` asynchronously — about 0.7s after
+/// the init exits on LXD 6.9 — so that key alone cannot tell a sandbox LXD
+/// stopped from one whose init just exited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopSeen {
+    /// Found already stopped, by a poll or a reconcile: LXD may have stopped
+    /// it with the daemon or the host, so the recorded power is trusted.
+    Discovered,
+    /// Announced by a live lifecycle event, so LXD is up and the stop was the
+    /// init exiting or a stop that was asked for.
+    Live,
+}
+
+/// Whether LXD, rather than the sandbox's own init, looks to have stopped
+/// `instance`. Only meaningful for a sandbox found already stopped; the
+/// caller confirms it by re-reading, since the marker is cleared late.
+pub(crate) fn stopped_by_the_runtime(instance: &Instance) -> bool {
+    instance.status == "Stopped"
+        && !instance.config.contains_key(KEY_STOP_INTENT)
+        && instance
+            .config
+            .get(KEY_LAST_POWER)
+            .is_some_and(|power| power == "RUNNING")
+}
+
+fn to_driver_sandbox(instance: &Instance, stop_seen: StopSeen) -> DriverSandbox {
     DriverSandbox {
         id: instance
             .config
@@ -134,7 +181,7 @@ pub fn instance_to_driver_sandbox(instance: &Instance) -> DriverSandbox {
             instance_id: instance.name.clone(),
             agent_fd: String::new(),
             sandbox_fd: String::new(),
-            conditions: vec![ready_condition(instance)],
+            conditions: vec![ready_condition(instance, stop_seen)],
             deleting: false,
         }),
     }
@@ -146,6 +193,14 @@ pub fn instance_to_driver_sandbox(instance: &Instance) -> DriverSandbox {
 /// Terminal: the gateway deliberately does not relaunch these at startup, so a
 /// genuine failure keeps its error signal.
 pub(crate) const CONDITION_EXITED: &str = "ContainerExited";
+
+/// Ready-condition reason when the runtime stopped a sandbox that was running
+/// — LXD shutting down with the daemon or the host — rather than its init
+/// exiting. The gateway treats it as terminal like [`CONDITION_EXITED`]. From
+/// OpenShell v0.1.0-pre.1 it restarts sandboxes with this reason at startup,
+/// but only for drivers that report `gateway_manages_lifecycle`, which this
+/// driver does not.
+pub(crate) const CONDITION_RUNTIME_RESTART: &str = "ContainerRuntimeRestart";
 
 /// Ready-condition reason when a sandbox was stopped through the API, i.e. the
 /// driver was asked to stop it. The gateway treats this as recoverable.
@@ -187,7 +242,7 @@ const KEY_LAST_POWER: &str = "volatile.last_state.power";
 ///
 /// The message is what the gateway shows the user next to the reason, so a
 /// sandbox that is not ready always says why, and where to look.
-fn ready_condition(instance: &Instance) -> DriverCondition {
+fn ready_condition(instance: &Instance, stop_seen: StopSeen) -> DriverCondition {
     let (status, reason, message) = match instance.status.as_str() {
         // A guest that signalled readiness over devlxd reports `Ready`; treat
         // it as running rather than falling through to `Unknown`.
@@ -205,6 +260,19 @@ fn ready_condition(instance: &Instance) -> DriverCondition {
                     "False",
                     CONDITION_STOPPED,
                     "sandbox instance was stopped on request".to_string(),
+                )
+            } else if stop_seen == StopSeen::Discovered && stopped_by_the_runtime(instance) {
+                // LXD records RUNNING when it stops a running instance on its
+                // own shutdown, so it can bring it back; an init that exits
+                // records STOPPED — but only once LXD has finished the stop,
+                // so this is reached for a sandbox found already stopped and
+                // confirmed by a re-read, never off a live lifecycle event.
+                (
+                    "False",
+                    CONDITION_RUNTIME_RESTART,
+                    "LXD stopped the running sandbox instance (daemon or host shutdown) and \
+                     has not started it again"
+                        .to_string(),
                 )
             } else {
                 (
@@ -647,6 +715,13 @@ mod tests {
         );
     }
 
+    /// The condition for a sandbox found already stopped, which is what most
+    /// of these tests are about; the live-event variant is covered on its own
+    /// in [`a_live_stop_is_never_a_runtime_restart`].
+    fn ready_condition_of(instance: &Instance) -> DriverCondition {
+        ready_condition(instance, StopSeen::Discovered)
+    }
+
     fn instance_with(status: &str, config: &[(&str, &str)]) -> Instance {
         Instance {
             name: "sb".to_string(),
@@ -666,6 +741,99 @@ mod tests {
         }
     }
 
+    /// Observed on LXD 6.9: an instance stopped by `snap restart lxd` and not
+    /// autostarted keeps `volatile.last_state.power=RUNNING`; one whose init
+    /// exited has `STOPPED`.
+    #[test]
+    fn stopped_by_the_runtime_is_a_runtime_restart() {
+        let cond = ready_condition_of(&instance_with(
+            "Stopped",
+            &[("volatile.last_state.power", "RUNNING")],
+        ));
+        assert_eq!(cond.status, "False");
+        assert_eq!(cond.reason, CONDITION_RUNTIME_RESTART);
+
+        // A requested stop wins: the driver stopped it, whatever LXD recorded.
+        let requested = ready_condition_of(&instance_with(
+            "Stopped",
+            &[
+                ("volatile.last_state.power", "RUNNING"),
+                (KEY_STOP_INTENT, CONDITION_STOPPED),
+            ],
+        ));
+        assert_eq!(requested.reason, CONDITION_STOPPED);
+    }
+
+    /// LXD rewrites `volatile.last_state.power` only once it has finished
+    /// stopping an instance — 0.62–0.75s after the init exits, measured over
+    /// 20 stops on LXD 6.9 — so the very state a dying sandbox passes through
+    /// is the one a runtime restart is recognized by. A lifecycle event
+    /// announcing the stop proves LXD is up, which settles it: the init
+    /// exited.
+    #[test]
+    fn a_live_stop_is_never_a_runtime_restart() {
+        let just_died = instance_with("Stopped", &[("volatile.last_state.power", "RUNNING")]);
+
+        assert_eq!(
+            ready_condition(&just_died, StopSeen::Live).reason,
+            CONDITION_EXITED
+        );
+        assert_eq!(
+            ready_condition(&just_died, StopSeen::Discovered).reason,
+            CONDITION_RUNTIME_RESTART
+        );
+        let live = instance_to_driver_sandbox_live(&just_died)
+            .status
+            .expect("status is always reported");
+        assert_eq!(live.conditions[0].reason, CONDITION_EXITED);
+
+        // A stop that was asked for reads the same either way.
+        let requested = instance_with(
+            "Stopped",
+            &[
+                ("volatile.last_state.power", "RUNNING"),
+                (KEY_STOP_INTENT, CONDITION_STOPPED),
+            ],
+        );
+        assert_eq!(
+            ready_condition(&requested, StopSeen::Live).reason,
+            CONDITION_STOPPED
+        );
+    }
+
+    /// The predicate the driver re-reads on must match the branch that
+    /// reports the reason, or a sandbox would be waited for and then reported
+    /// as something else.
+    #[test]
+    fn stopped_by_the_runtime_matches_the_reported_reason() {
+        for (config, expected) in [
+            (vec![("volatile.last_state.power", "RUNNING")], true),
+            (vec![("volatile.last_state.power", "STOPPED")], false),
+            (vec![], false),
+            (
+                vec![
+                    ("volatile.last_state.power", "RUNNING"),
+                    (KEY_STOP_INTENT, CONDITION_STOPPED),
+                ],
+                false,
+            ),
+        ] {
+            let instance = instance_with("Stopped", &config);
+            assert_eq!(stopped_by_the_runtime(&instance), expected, "{config:?}");
+            assert_eq!(
+                ready_condition_of(&instance).reason == CONDITION_RUNTIME_RESTART,
+                expected,
+                "{config:?}"
+            );
+        }
+
+        // A running sandbox is never waiting to be confirmed.
+        assert!(!stopped_by_the_runtime(&instance_with(
+            "Running",
+            &[("volatile.last_state.power", "RUNNING")]
+        )));
+    }
+
     /// The reason strings are a contract with the gateway, not cosmetic: it
     /// keys "is this transient?" and "may this be recovered at startup?" off
     /// these exact values.
@@ -673,7 +841,7 @@ mod tests {
     fn stopped_reason_distinguishes_death_from_requested_stop() {
         // Ran, then its init exited on its own → terminal ContainerExited.
         let died = instance_with("Stopped", &[("volatile.last_state.power", "STOPPED")]);
-        let cond = ready_condition(&died);
+        let cond = ready_condition_of(&died);
         assert_eq!(cond.status, "False");
         assert_eq!(cond.reason, CONDITION_EXITED);
 
@@ -685,7 +853,7 @@ mod tests {
                 (KEY_STOP_INTENT, CONDITION_STOPPED),
             ],
         );
-        assert_eq!(ready_condition(&stopped).reason, CONDITION_STOPPED);
+        assert_eq!(ready_condition_of(&stopped).reason, CONDITION_STOPPED);
     }
 
     /// A created-but-never-started instance is also `Stopped` in LXD. Reporting
@@ -694,7 +862,7 @@ mod tests {
     #[test]
     fn never_started_instance_is_transient_not_terminal() {
         let fresh = instance_with("Stopped", &[]);
-        let cond = ready_condition(&fresh);
+        let cond = ready_condition_of(&fresh);
         assert_eq!(cond.status, "False");
         assert_eq!(cond.reason, CONDITION_CREATED);
     }
@@ -702,24 +870,27 @@ mod tests {
     #[test]
     fn running_and_guest_signalled_ready_are_both_ready() {
         assert_eq!(
-            ready_condition(&instance_with("Running", &[])).status,
+            ready_condition_of(&instance_with("Running", &[])).status,
             "True"
         );
         // LXD reports `Ready` once a guest signals over devlxd; without this
         // arm it fell through to `Unknown`.
-        assert_eq!(ready_condition(&instance_with("Ready", &[])).status, "True");
+        assert_eq!(
+            ready_condition_of(&instance_with("Ready", &[])).status,
+            "True"
+        );
     }
 
     #[test]
     fn transient_states_are_reported_with_transient_reasons() {
         assert_eq!(
-            ready_condition(&instance_with("Starting", &[])).reason,
+            ready_condition_of(&instance_with("Starting", &[])).reason,
             CONDITION_STARTING
         );
         // An unrecognised status stays Unknown, which the gateway maps to
         // Provisioning rather than Error.
         assert_eq!(
-            ready_condition(&instance_with("Weird", &[])).status,
+            ready_condition_of(&instance_with("Weird", &[])).status,
             "Unknown"
         );
     }
@@ -731,7 +902,7 @@ mod tests {
     /// same as on Docker.
     #[test]
     fn frozen_is_reported_as_paused() {
-        let cond = ready_condition(&instance_with("Frozen", &[]));
+        let cond = ready_condition_of(&instance_with("Frozen", &[]));
         assert_eq!(cond.status, "False");
         assert_eq!(cond.reason, CONDITION_PAUSED);
     }
@@ -750,7 +921,7 @@ mod tests {
             instance_with("Error", &[]),
             instance_with("Weird", &[]),
         ] {
-            let cond = ready_condition(&instance);
+            let cond = ready_condition_of(&instance);
             assert!(
                 !cond.message.is_empty(),
                 "{} {:?} has no message",
@@ -758,14 +929,17 @@ mod tests {
                 instance.config
             );
         }
-        assert_eq!(ready_condition(&instance_with("Running", &[])).message, "");
+        assert_eq!(
+            ready_condition_of(&instance_with("Running", &[])).message,
+            ""
+        );
     }
 
     #[test]
     fn exited_message_points_at_the_console_log() {
         let ran = ("volatile.last_state.power", "STOPPED");
 
-        let cond = ready_condition(&instance_with("Stopped", &[ran]));
+        let cond = ready_condition_of(&instance_with("Stopped", &[ran]));
         assert!(
             cond.message.contains("`lxc console sb --show-log`"),
             "{}",
@@ -776,7 +950,7 @@ mod tests {
             project: "sandboxes".to_string(),
             ..instance_with("Stopped", &[ran])
         };
-        let cond = ready_condition(&in_project);
+        let cond = ready_condition_of(&in_project);
         assert!(
             cond.message
                 .contains("`lxc console sb --project sandboxes --show-log`"),
@@ -787,15 +961,16 @@ mod tests {
 
     #[test]
     fn lxd_error_status_is_reported_as_error() {
-        let cond = ready_condition(&instance_with("Error", &[]));
+        let cond = ready_condition_of(&instance_with("Error", &[]));
         assert_eq!(cond.status, "False");
         assert_eq!(cond.reason, "Error");
     }
 
     /// Phase the OpenShell v0.0.116 gateway derives from a `Ready` condition
     /// (`crates/openshell-server/src/compute/mod.rs`, `derive_phase` and
-    /// `is_terminal_failure_reason`, lines 4033-4131). Mirrored here so every
-    /// reason the driver emits is checked against how the gateway reads it.
+    /// `is_terminal_failure_reason`, lines 4033-4131; the transient reasons
+    /// are unchanged in v0.1.0-pre.1). Mirrored here so every reason the
+    /// driver emits is checked against how the gateway reads it.
     fn v0_0_116_gateway_phase(cond: &DriverCondition) -> &'static str {
         const TRANSIENT_REASONS: &[&str] = &[
             "reconcilererror",
@@ -836,6 +1011,10 @@ mod tests {
             (instance_with("Weird", &[]), "Provisioning"),
             (instance_with("Stopped", &[ran]), "Error"),
             (
+                instance_with("Stopped", &[("volatile.last_state.power", "RUNNING")]),
+                "Error",
+            ),
+            (
                 instance_with("Stopped", &[ran, (KEY_STOP_INTENT, CONDITION_STOPPED)]),
                 "Error",
             ),
@@ -844,7 +1023,7 @@ mod tests {
         ];
 
         for (instance, expected) in cases {
-            let cond = ready_condition(&instance);
+            let cond = ready_condition_of(&instance);
             assert_eq!(cond.r#type, "Ready");
             assert_eq!(
                 v0_0_116_gateway_phase(&cond),

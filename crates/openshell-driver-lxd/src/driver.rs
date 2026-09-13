@@ -25,6 +25,16 @@ const DRIVER_NAME: &str = "lxd";
 /// init is still up. See [`LxdComputeDriver::settle_after_start`].
 const SETTLE_DELAY: Duration = Duration::from_secs(3);
 
+/// How long LXD may take to clear `volatile.last_state.power` after a
+/// sandbox's init exits, before that key can be read as "LXD stopped it".
+///
+/// LXD writes the key when the instance starts and rewrites it as part of
+/// finishing the stop, so an init that exited by itself reads as stopped but
+/// still `RUNNING` until then. Measured at 0.62–0.75s over 20 stops on LXD
+/// 6.9; three times the longest leaves room on a loaded host.
+/// See [`LxdComputeDriver::confirm_runtime_restart`].
+const RUNTIME_RESTART_SETTLE: Duration = Duration::from_millis(2250);
+
 /// Returns true if `err` indicates the instance was already stopped.
 ///
 /// Covers both cases: LXD rejects the stop request synchronously with a
@@ -318,16 +328,58 @@ impl LxdComputeDriver {
 
     pub async fn get_sandbox(&self, name: &str) -> Result<DriverSandbox, DriverError> {
         let instance = self.get_managed_instance(name).await?;
+        let instance = self.confirm_runtime_restart(instance).await;
         Ok(mapping::instance_to_driver_sandbox(&instance))
     }
 
     pub async fn list_sandboxes(&self) -> Result<Vec<DriverSandbox>, DriverError> {
         let instances = self.lxd.list_instances().await?;
-        Ok(instances
+        let mut sandboxes: Vec<DriverSandbox> = Vec::new();
+        let mut unsettled: Vec<usize> = Vec::new();
+        for instance in instances
             .iter()
             .filter(|i| i.config.contains_key(mapping::KEY_SANDBOX_ID))
-            .map(mapping::instance_to_driver_sandbox)
-            .collect())
+        {
+            if mapping::stopped_by_the_runtime(instance) {
+                unsettled.push(sandboxes.len());
+            }
+            sandboxes.push(mapping::instance_to_driver_sandbox(instance));
+        }
+
+        // One wait covers every sandbox that looked stopped by LXD, so a list
+        // costs at most a single settle however many of them there are.
+        if !unsettled.is_empty() {
+            tokio::time::sleep(RUNTIME_RESTART_SETTLE).await;
+            for index in unsettled {
+                let Ok(instance) = self.lxd.get_instance(&sandboxes[index].name).await else {
+                    continue;
+                };
+                sandboxes[index] = mapping::instance_to_driver_sandbox(&instance);
+            }
+        }
+        Ok(sandboxes)
+    }
+
+    /// Re-reads a sandbox that looks stopped by LXD itself, once the marker
+    /// it is recognized by has had time to settle.
+    ///
+    /// `volatile.last_state.power` stays `RUNNING` for about a second after
+    /// an init exits (see [`RUNTIME_RESTART_SETTLE`]), so reporting straight
+    /// off the first read would call every sandbox that just died a runtime
+    /// restart. A marker still set after the wait is a real one: LXD stopped
+    /// the sandbox and has not brought it back.
+    async fn confirm_runtime_restart(
+        &self,
+        instance: lxd_client::Instance,
+    ) -> lxd_client::Instance {
+        if !mapping::stopped_by_the_runtime(&instance) {
+            return instance;
+        }
+        tokio::time::sleep(RUNTIME_RESTART_SETTLE).await;
+        self.lxd
+            .get_instance(&instance.name)
+            .await
+            .unwrap_or(instance)
     }
 
     /// Resolves an instance name from a gateway-assigned `sandbox_id` by

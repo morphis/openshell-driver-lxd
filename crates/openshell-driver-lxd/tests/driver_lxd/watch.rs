@@ -105,6 +105,38 @@ async fn supervisor_exit_is_pushed_as_container_exited() {
     assert_eq!(sandbox.name, name);
 }
 
+/// A sandbox LXD stopped — with the daemon or the host — and did not bring
+/// back keeps `volatile.last_state.power=RUNNING`; that marker is the only
+/// thing separating it from an init that exited.
+///
+/// The driver no longer trusts the marker on sight, because LXD leaves it at
+/// `RUNNING` for about 0.7s after an init that exits moments after starting
+/// (LXD 6.9). It confirms it by re-reading, and a marker that survives still
+/// has to report the runtime restart.
+#[tokio::test]
+async fn a_sandbox_lxd_stopped_is_reported_as_a_runtime_restart() {
+    let driver = Driver::start().await;
+    let name = unique_name("wrestart");
+    let _cleanup = driver.cleanup(&[&name]);
+    driver.create_running(&name).await;
+
+    // Down, with no stop the driver was asked for, and still recorded as
+    // having been running: what LXD leaves behind when it goes down under a
+    // sandbox and does not autostart it again.
+    lxc(&["stop", "--force", &name]);
+    lxc(&[
+        "config",
+        "set",
+        &name,
+        "volatile.last_state.power",
+        "RUNNING",
+    ]);
+
+    let cond = driver.ready_condition(&name).await;
+    assert_eq!(cond.reason, "ContainerRuntimeRestart", "{cond:?}");
+    assert_eq!(cond.status, "False", "{cond:?}");
+}
+
 #[tokio::test]
 async fn out_of_band_force_stop_is_pushed_as_container_exited() {
     let driver = Driver::start().await;

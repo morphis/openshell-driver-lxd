@@ -242,7 +242,10 @@ async fn run_once(
         };
         known_sandbox_ids.insert(name.clone(), sandbox_id.clone());
 
-        let sandbox = mapping::instance_to_driver_sandbox(&instance);
+        // Off a live event: LXD is up to have sent it, so a stop it announces
+        // is the init exiting or one that was asked for, never LXD going down
+        // with the daemon or the host.
+        let sandbox = mapping::instance_to_driver_sandbox_live(&instance);
         tracing::debug!(
             name = %name,
             action = %action,

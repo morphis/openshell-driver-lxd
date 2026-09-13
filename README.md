@@ -388,6 +388,7 @@ the gateway restarts:
 | `Running` / `Ready` | — (`Ready=True`) | `Ready` |
 | `Stopped`, init exited by itself | `ContainerExited` | `Error` (terminal) |
 | `Stopped`, stop requested | `ContainerStopped` | `Stopped` |
+| `Stopped` by LXD shutting down, not restarted | `ContainerRuntimeRestart` | `Error` (see below) |
 | `Stopped`, never started | `ContainerCreated` | `Provisioning` |
 | `Starting` | `ContainerStarting` | `Provisioning` |
 | `Frozen` | `ContainerPaused` | `Error` |
@@ -398,6 +399,13 @@ to stop one. Without it a user-requested stop is indistinguishable from a
 crash and surfaces as `Error` instead of `Stopped`. Starting the sandbox again
 (`openshell sandbox start`) clears the marker and pushes the current TLS
 materials before the instance starts.
+
+`volatile.last_state.power=RUNNING` on a stopped instance means LXD stopped it
+while it was running, on its own or the host's shutdown, and did not start it
+again. Its reason, `ContainerRuntimeRestart`, is what upstream's Docker and
+Podman drivers give such containers. The gateway still shows it as `Error`:
+from v0.1.0-pre.1 it restarts sandboxes with that reason at startup, but only
+for drivers that report `gateway_manages_lifecycle`, and this driver does not.
 
 Note that the supervisor does not act on LXD's shutdown signal, so a graceful
 stop never completes on its own. `stop_sandbox` bounds the graceful attempt
