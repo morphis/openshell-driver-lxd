@@ -20,6 +20,7 @@ mod types;
 pub use acls::{AclAction, AclProtocol, AclState, LxdNetworkAclRule};
 pub use client::{LxdClient, LxdEndpoint, LxdHttpsConfig, DEFAULT_PROJECT};
 pub use error::LxdError;
+pub use events::EventStream;
 pub use types::{
     Instance, InstanceState, InstanceStateCpu, InstanceStateDisk, InstanceStateMemory,
     InstanceStateNetwork, InstanceStateNetworkAddress, LxdEvent, LxdServerInfo, Network, Operation,

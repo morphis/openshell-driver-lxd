@@ -229,8 +229,15 @@ async fn wait_operation_unknown_id_returns_404() {
     }
 }
 
+/// Held by tests that create or delete projects and by tests that update
+/// network ACLs. Updating an ACL makes LXD look up every project that might
+/// use it, and a project deleted during that lookup fails the update with
+/// "Failed loading project ...: Project not found".
+static PROJECT_SET_CHANGES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn ensure_network_acl_create_update_delete() {
+    let _projects = PROJECT_SET_CHANGES.lock().await;
     let client = client();
     let acl_name = unique_name();
 
@@ -243,18 +250,67 @@ async fn ensure_network_acl_create_update_delete() {
         .expect("ensure_network_acl should create a new ACL");
 
     // Idempotent: update the ruleset on an existing ACL.
+    let rules = vec![
+        LxdNetworkAclRule::allow_egress_tcp("192.168.0.0/16", 443),
+        LxdNetworkAclRule::allow_egress("192.0.2.0/24,198.51.100.0/24", None, "")
+            .described("any protocol"),
+    ];
+    client
+        .ensure_network_acl(&acl_name, rules.clone())
+        .await
+        .expect("ensure_network_acl should update an existing ACL");
+
+    // Unchanged rules leave the ACL alone: LXD reports no update. A driver
+    // ensures its ACL on every sandbox create, so rewriting it each time
+    // would churn the rules applied to every running sandbox.
+    let mut events = client
+        .subscribe_events(&["lifecycle"])
+        .await
+        .expect("subscribe to lifecycle events");
+    client
+        .ensure_network_acl(&acl_name, rules)
+        .await
+        .expect("ensure_network_acl with the same rules should succeed");
+    assert!(
+        !acl_updated(&mut events, &acl_name, Duration::from_secs(2)).await,
+        "an unchanged ACL should not be rewritten"
+    );
+    // A real change is written, which also shows the check above can fail.
     client
         .ensure_network_acl(
             &acl_name,
-            vec![LxdNetworkAclRule::allow_egress_tcp("192.168.0.0/16", 443)],
+            vec![LxdNetworkAclRule::allow_egress_tcp("192.168.0.0/16", 8443)],
         )
         .await
-        .expect("ensure_network_acl should update an existing ACL");
+        .expect("ensure_network_acl should update changed rules");
+    assert!(
+        acl_updated(&mut events, &acl_name, Duration::from_secs(10)).await,
+        "a changed ACL should be rewritten"
+    );
 
     client
         .delete_network_acl(&acl_name)
         .await
         .expect("delete_network_acl should succeed");
+}
+
+/// Whether LXD reports ACL `name` updated within `wait`.
+async fn acl_updated(events: &mut lxd_client::EventStream, name: &str, wait: Duration) -> bool {
+    use futures::StreamExt;
+    tokio::time::timeout(wait, async {
+        while let Some(Ok(event)) = events.next().await {
+            let action = event.metadata["action"].as_str().unwrap_or_default();
+            let source = event.metadata["source"].as_str().unwrap_or_default();
+            if action == "network-acl-updated"
+                && source.split('?').next() == Some(&format!("/1.0/network-acls/{name}"))
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
 }
 
 #[tokio::test]
@@ -294,6 +350,7 @@ async fn project_exists_false_for_nonexistent_project() {
 
 #[tokio::test]
 async fn project_exists_with_non_default_project_client() {
+    let _projects = PROJECT_SET_CHANGES.lock().await;
     let default_client = client();
     let project_name = unique_name();
 
@@ -673,6 +730,7 @@ async fn create_image_from_split_streams_rootfs() {
 /// and then waits for their operations in the wrong project.
 #[tokio::test]
 async fn raw_uploads_and_file_access_stay_in_the_client_project() {
+    let _projects = PROJECT_SET_CHANGES.lock().await;
     let default_client = client();
     let project = unique_name();
     default_client
