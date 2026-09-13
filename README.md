@@ -83,19 +83,36 @@ gateway so you can create a sandbox end-to-end.
    below — the driver uses it to construct each sandbox's `OPENSHELL_ENDPOINT`.
 
 3. **Start an OpenShell gateway pointed at the driver's socket**, using the
-   out-of-tree driver flags. A plaintext gateway still enforces request
-   authentication by default, so for local/dev use also pass a `--config`
-   file disabling it:
+   out-of-tree driver flags. The gateway must be able to mint sandbox tokens
+   (`gateway_jwt`), or every supervisor exits with "no sandbox token source
+   available". A plaintext gateway still enforces request authentication by
+   default, so for local/dev use the config also disables it. This is the
+   setup the upstream test suites run against OpenShell v0.0.116 (config
+   schema `version = 1` and `--drivers`; later gateways use `version = 2`
+   and `--compute-driver`):
 
    ```sh
+   openssl genpkey -algorithm ed25519 -out /tmp/openshell-jwt.pem
+   openssl pkey -in /tmp/openshell-jwt.pem -pubout -out /tmp/openshell-jwt.pub
+   echo lxd-demo > /tmp/openshell-jwt.kid
+
    cat > /tmp/openshell-gateway.toml <<'EOF'
+   [openshell]
+   version = 1
+
    [openshell.gateway.auth]
    allow_unauthenticated_users = true
+
+   [openshell.gateway.gateway_jwt]
+   signing_key_path = "/tmp/openshell-jwt.pem"
+   public_key_path = "/tmp/openshell-jwt.pub"
+   kid_path = "/tmp/openshell-jwt.kid"
    EOF
 
+   BRIDGE_IP="$(lxc network get lxdbr0 ipv4.address | cut -d/ -f1)"
    openshell-gateway \
        --disable-tls \
-       --bind-address 0.0.0.0 \
+       --bind-address "$BRIDGE_IP" \
        --port 17670 \
        --drivers lxd \
        --compute-driver-socket /tmp/openshell-driver.sock \
@@ -103,16 +120,22 @@ gateway so you can create a sandbox end-to-end.
        --config /tmp/openshell-gateway.toml
    ```
 
-   `--bind-address 0.0.0.0` is required: the default loopback-only bind is
-   unreachable from sandboxes on LXD's `lxdbr0` bridge network. `--disable-tls`
-   plus `allow_unauthenticated_users` are a plaintext, unauthenticated dev
+   The gateway binds to the `lxdbr0` bridge address: the default loopback-only
+   bind is unreachable from sandboxes, and the driver points each sandbox's
+   `OPENSHELL_ENDPOINT` at that address. `--disable-tls` plus
+   `allow_unauthenticated_users` are a plaintext, unauthenticated dev
    shortcut — **not** for production use; see
    [Security limitations](#security-limitations).
+
+   Run the supervisor released with the gateway: pass
+   `--supervisor-image ghcr.io/nvidia/openshell/supervisor:<gateway version>`
+   to the driver. A supervisor from a different release than the gateway can
+   fail to sync policy and exit.
 
 4. **Register the gateway with the CLI and create a sandbox:**
 
    ```sh
-   openshell gateway add http://127.0.0.1:17670 --local --name lxd-demo
+   openshell gateway add "http://$BRIDGE_IP:17670" --local --name lxd-demo
    openshell gateway select lxd-demo
 
    openshell sandbox create --name demo -- id
@@ -247,6 +270,43 @@ crash and surfaces as `Error` instead of `Stopped`.
 Note that the supervisor does not act on LXD's shutdown signal, so a graceful
 stop never completes on its own. `stop_sandbox` bounds the graceful attempt
 with `--stop-timeout-secs` (default 10s) and then stops the instance forcibly.
+
+## Conformance
+
+`make test-conformance` runs upstream OpenShell's own conformance suite
+(`openshell-conformance`) against a gateway backed by this driver on the
+local LXD, the way upstream validates its in-tree drivers:
+
+- `smoke`: create a sandbox, see it `Ready`, list it, exec in it, delete it.
+- `sandbox-continuity`: a running sandbox keeps its workload and a stopped
+  one stays stopped across a gateway restart and a driver restart.
+
+Both this and `make test-upstream-e2e` below run in the environment
+`scripts/openshell-env.sh` provides. It pins the OpenShell side to one
+release — gateway, CLI and supervisor image from v0.0.116, verified by
+checksum and digest — because mixing components from different releases
+fails in ways that are not the driver's, and runs everything in a throwaway
+LXD project (`openshell-test`) that shares the default project's image cache.
+The conformance runner is built from the newest upstream revision the pinned
+CLI can drive.
+
+On failure, the driver and gateway logs and LXD's lifecycle events are left
+in `target/openshell-test/artifacts`, with each suite's reports in a
+subdirectory. `scripts/openshell-env.sh up` starts the environment and
+leaves it running for debugging; `scripts/openshell-env.sh down` removes it.
+
+`make test-upstream-e2e` runs, against the same environment and release,
+upstream's end-to-end tests for what happens inside a sandbox: L4 and L7
+network policy, SSRF protections, credential handling, live policy updates,
+Landlock filesystem rules and `inference.local` routing. The supervisor
+enforces all of this, but only as far as the container lets it, and a sandbox
+that silently enforces nothing still passes smoke. The tests come from the
+v0.0.116 source tree (the Rust tests of `e2e/rust` and the Python tests of
+`e2e/python`, run through the release's Python SDK); upstream tests specific
+to the Docker or Podman drivers are left out. It additionally needs rootless
+podman (with `uidmap` and `passt`) for a test fixture server, and
+`python3` 3.11 or newer. Logs and a JUnit report land in
+`target/openshell-test/artifacts/upstream-e2e`.
 
 ## Known limitations
 

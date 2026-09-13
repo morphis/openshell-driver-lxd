@@ -1,4 +1,4 @@
-.PHONY: build release check test test-lxd-client test-driver setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean
+.PHONY: build release check test test-lxd-client test-driver test-conformance test-upstream-e2e setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean
 
 build:
 	cargo build --workspace
@@ -25,6 +25,22 @@ test-lxd-client: setup-lxd-test-env
 # `cargo test -p openshell-driver-lxd -- --ignored` runs the tests for known gaps.
 test-driver:
 	cargo test -p openshell-driver-lxd -- --test-threads=1
+
+# Runs upstream OpenShell's conformance suite against a gateway backed by this
+# driver, in the environment scripts/openshell-env.sh provides with its pinned
+# OpenShell release. Needs the same tools and network access as test-driver,
+# plus curl, openssl and git. Not part of `test`: it downloads the pinned
+# release and takes a few minutes on a cold cache.
+test-conformance:
+	./scripts/conformance.sh
+
+# Runs upstream OpenShell's end-to-end tests for sandbox policy enforcement,
+# Landlock and inference routing against the same environment and pinned
+# release as test-conformance. Additionally needs rootless podman (with uidmap
+# and passt) and python3 >= 3.11. Takes several minutes, plus about one more
+# on a cold cache to fetch and build the tests.
+test-upstream-e2e:
+	./scripts/upstream-e2e.sh
 
 # Provisions LXD for lxd-client's integration tests (see
 # crates/lxd-client/tests/integration.rs). Idempotent; a prerequisite of
@@ -64,7 +80,8 @@ proto:
 UPSTREAM_PROTOS := compute_driver.proto options.proto
 
 # OpenShell release the vendored protos are taken from. Keep it in step with
-# the OpenShell release the driver targets.
+# the release pinned in scripts/openshell-env.sh, which the test suites run
+# against.
 OPENSHELL_REF ?= v0.0.116
 
 # Sync proto/ with upstream NVIDIA/OpenShell at $(OPENSHELL_REF).

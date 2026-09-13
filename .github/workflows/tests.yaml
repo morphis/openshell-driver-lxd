@@ -46,3 +46,33 @@ jobs:
         run: sudo apt-get install --no-install-recommends -y skopeo umoci squashfs-tools busybox-static
       - name: Run driver tests
         run: make test-driver
+
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Free disk space
+        # Importing the sandbox image needs several GiB of scratch space on
+        # top of LXD's own copy of it.
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: canonical/setup-lxd@da2ac84e727dc534215fd14cd088b9209d65893b
+        with:
+          channel: latest/stable
+      - name: Install rustup
+        run: sudo snap install --classic rustup
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --component rustfmt,clippy
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y protobuf-compiler libprotobuf-dev
+      - name: Install image import tools
+        run: sudo apt-get install --no-install-recommends -y skopeo umoci squashfs-tools
+      - name: Run conformance suite
+        run: make test-conformance
+      - name: Upload conformance artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: conformance-artifacts
+          path: target/openshell-test/artifacts
+          if-no-files-found: ignore
