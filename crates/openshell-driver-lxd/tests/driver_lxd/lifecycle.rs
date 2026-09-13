@@ -537,6 +537,10 @@ async fn guest_tls_materials_reach_the_instance() {
         std::fs::write(&path, format!("test {file}")).expect("write TLS material");
         extra_args.extend([flag.to_string(), path.display().to_string()]);
     }
+    extra_args.extend([
+        "--gateway-tls-server-name".to_string(),
+        "gateway.openshell.internal".to_string(),
+    ]);
     let driver = Driver::start_with(DriverOptions {
         allow_plaintext_gateway: false,
         extra_args,
@@ -562,6 +566,12 @@ async fn guest_tls_materials_reach_the_instance() {
             .get("environment.OPENSHELL_ENDPOINT")
             .map(String::as_str),
         Some(expected_endpoint.as_str())
+    );
+    assert_eq!(
+        config
+            .get("environment.OPENSHELL_GATEWAY_TLS_SERVER_NAME")
+            .map(String::as_str),
+        Some("gateway.openshell.internal")
     );
     for (file, _, env, guest_path) in files {
         assert_eq!(

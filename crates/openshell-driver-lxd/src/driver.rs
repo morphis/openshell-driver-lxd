@@ -279,6 +279,12 @@ impl LxdComputeDriver {
         if self.config.guest_tls().is_some() {
             guest_files.extend(self.read_guest_tls_files().await?);
             mapping::insert_guest_tls_environment(&mut config);
+            if let Some(name) = &self.config.gateway_tls_server_name {
+                config.insert(
+                    "environment.OPENSHELL_GATEWAY_TLS_SERVER_NAME".to_string(),
+                    name.clone(),
+                );
+            }
         }
         if self.config.sandbox_nesting {
             config.insert("security.nesting".to_string(), "true".to_string());

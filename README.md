@@ -243,7 +243,9 @@ gateway in an instance or on another machine, or sandboxes on an OVN network,
 whose address belongs to its virtual router — set it explicitly with
 `--gateway-endpoint` (for example `https://10.131.189.2:17670`). A sandbox on
 an OVN network without `--gateway-endpoint` is refused with
-`FailedPrecondition` rather than pointed at the router.
+`FailedPrecondition` rather than pointed at the router. When sandboxes reach
+the gateway at an address its certificate does not name, `--gateway-tls-server-name`
+sets the name they verify the certificate against instead.
 
 ## Images and Caching
 

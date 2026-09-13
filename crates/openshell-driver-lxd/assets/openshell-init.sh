@@ -177,12 +177,34 @@ fi
 # 8. Probe OPENSHELL_ENDPOINT reachability before handing off to supervisor.
 # ---------------------------------------------------------------------------
 # An https gateway asks for the client certificate the supervisor presents, so
-# the probe presents it too.
+# the probe presents it too, and like the supervisor it verifies the
+# certificate against OPENSHELL_GATEWAY_TLS_SERVER_NAME when that is set.
+endpoint_port() {
+    _ep="${OPENSHELL_ENDPOINT#*://}"
+    _ep="${_ep%%/*}"
+    _ep="${_ep##*\]}"
+    case "$_ep" in
+        *:*) printf '%s\n' "${_ep##*:}" ;;
+        *) case "$OPENSHELL_ENDPOINT" in https://*) echo 443 ;; *) echo 80 ;; esac ;;
+    esac
+}
+
 probe_endpoint() {
     if [ -n "${OPENSHELL_TLS_CA:-}" ]; then
+        _url="${OPENSHELL_ENDPOINT}"
+        set --
+        if [ -n "${OPENSHELL_GATEWAY_TLS_SERVER_NAME:-}" ]; then
+            _port=$(endpoint_port)
+            _target=$(endpoint_host)
+            case "$_target" in *:*) _target="[$_target]" ;; esac
+            _name="${OPENSHELL_GATEWAY_TLS_SERVER_NAME}"
+            case "$_name" in *:*) _name="[$_name]" ;; esac
+            _url="https://${_name}:${_port}"
+            set -- --connect-to "${_name}:${_port}:${_target}:${_port}"
+        fi
         curl --silent --max-time 5 --output /dev/null --write-out "%{http_code}" \
             --cacert "${OPENSHELL_TLS_CA}" --cert "${OPENSHELL_TLS_CERT:-}" \
-            --key "${OPENSHELL_TLS_KEY:-}" "${OPENSHELL_ENDPOINT}" 2>/dev/null
+            --key "${OPENSHELL_TLS_KEY:-}" "$@" "$_url" 2>/dev/null
     else
         curl --silent --max-time 5 --output /dev/null --write-out "%{http_code}" \
             "${OPENSHELL_ENDPOINT}" 2>/dev/null

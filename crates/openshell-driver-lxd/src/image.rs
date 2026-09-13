@@ -79,7 +79,9 @@ pub fn validate_reference(reference: &str) -> Result<(), DriverError> {
 /// Bump it whenever the conversion produces a different image for the same
 /// OCI digest, so images converted the old way are imported again instead of
 /// being reused. Revision 2 keeps the image's file ownership; revision 3 boots
-/// the init script through `/sbin/init`.
+/// the init script through `/sbin/init`, which also takes the nameserver from
+/// the network, reaches gateways by IPv6 address or host name and probes an
+/// https gateway the way the supervisor connects to it.
 pub const CONVERSION_REVISION: u32 = 3;
 
 /// Returns the deterministic LXD cache alias for the given content digest.

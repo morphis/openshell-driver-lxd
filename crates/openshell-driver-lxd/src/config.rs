@@ -250,6 +250,13 @@ pub struct Config {
     #[arg(long, requires_all = ["guest_tls_ca", "guest_tls_cert"])]
     pub guest_tls_key: Option<PathBuf>,
 
+    /// Name sandboxes verify the gateway's certificate against, instead of
+    /// the gateway endpoint's host (OPENSHELL_GATEWAY_TLS_SERVER_NAME). For
+    /// a gateway reached at an address its certificate does not name, e.g.
+    /// through a forward or NAT.
+    #[arg(long, value_parser = parse_tls_server_name)]
+    pub gateway_tls_server_name: Option<String>,
+
     /// Let sandboxes reach the gateway over plaintext HTTP instead of TLS.
     /// Sandbox tokens, policy and credentials then cross the network
     /// unencrypted, so this is only for local testing.
@@ -305,6 +312,13 @@ impl Config {
                     .to_string(),
             );
         }
+        if !tls && self.gateway_tls_server_name.is_some() {
+            return Err(
+                "--gateway-tls-server-name needs --guest-tls-ca, --guest-tls-cert and \
+                 --guest-tls-key: without TLS there is no certificate to verify"
+                    .to_string(),
+            );
+        }
         match self.gateway_endpoint.as_deref() {
             Some(endpoint) if tls && !endpoint.starts_with("https://") => Err(format!(
                 "--gateway-endpoint {endpoint} is not https, but sandboxes are given TLS \
@@ -316,6 +330,27 @@ impl Config {
             )),
             _ => Ok(()),
         }
+    }
+}
+
+/// Validates `--gateway-tls-server-name`: an IP address or a DNS name.
+fn parse_tls_server_name(value: &str) -> Result<String, String> {
+    if value.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(value.to_string());
+    }
+    let valid_label = |label: &str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if value.len() <= 253 && value.split('.').all(valid_label) {
+        Ok(value.to_string())
+    } else {
+        Err(format!("{value:?} is not a DNS name or an IP address"))
     }
 }
 
@@ -501,6 +536,35 @@ mod tests {
         let mut both = TLS_ARGS.to_vec();
         both.push("--allow-plaintext-gateway");
         assert!(parse(&both).is_err());
+    }
+
+    #[test]
+    fn tls_server_name_needs_tls_and_a_valid_name() {
+        let mut named = TLS_ARGS.to_vec();
+        named.extend(["--gateway-tls-server-name", "gateway.openshell.internal"]);
+        assert_eq!(
+            parse(&named).unwrap().gateway_tls_server_name.as_deref(),
+            Some("gateway.openshell.internal")
+        );
+
+        let mut address = TLS_ARGS.to_vec();
+        address.extend(["--gateway-tls-server-name", "10.131.189.2"]);
+        assert!(parse(&address).is_ok());
+
+        for bad in ["", "-gateway", "gate way", "gateway..internal"] {
+            let mut args = TLS_ARGS.to_vec();
+            args.extend(["--gateway-tls-server-name", bad]);
+            assert!(parse(&args).is_err(), "{bad:?} should be rejected");
+        }
+
+        // Without TLS materials there is no certificate to verify.
+        let plaintext = parse(&[
+            "--allow-plaintext-gateway",
+            "--gateway-tls-server-name",
+            "gateway.openshell.internal",
+        ])
+        .unwrap();
+        assert!(plaintext.validate().is_err());
     }
 
     #[test]
