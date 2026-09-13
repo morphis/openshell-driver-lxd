@@ -8,10 +8,10 @@
 //! stream and pushes an updated sandbox snapshot straight away, the same way
 //! the upstream Podman driver forwards runtime events.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
-use lxd_client::LxdClient;
+use lxd_client::{LxdClient, LxdEvent};
 use tokio::sync::broadcast;
 
 use crate::grpc::WatchEvent;
@@ -45,6 +45,36 @@ const WATCHED_ACTIONS: &[&str] = &[
 /// so the watcher reports it as a deletion of the sandbox it last knew under
 /// that name.
 const DELETED_ACTION: &str = "instance-deleted";
+
+/// How many recent events to remember when dropping duplicates.
+const RECENT_EVENTS: usize = 64;
+
+/// Recently seen events, to drop the duplicates clustered LXD delivers.
+///
+/// A clustered LXD (observed on a single-member MicroCloud, LXD 6.9) sends
+/// every lifecycle event to a listener twice — same timestamp, same metadata,
+/// `lxc monitor` shows it too. Forwarding both would re-read each instance and
+/// push each snapshot twice. Two genuinely distinct events never share both
+/// the nanosecond timestamp and the metadata, so that pair identifies one.
+#[derive(Debug, Default)]
+struct RecentEvents {
+    keys: VecDeque<String>,
+}
+
+impl RecentEvents {
+    /// Records `event`, returning `false` if it was already seen.
+    fn first_sighting(&mut self, event: &LxdEvent) -> bool {
+        let key = format!("{} {}", event.timestamp, event.metadata);
+        if self.keys.contains(&key) {
+            return false;
+        }
+        if self.keys.len() == RECENT_EVENTS {
+            self.keys.pop_front();
+        }
+        self.keys.push_back(key);
+        true
+    }
+}
 
 /// Extracts the instance name from a lifecycle event's metadata.
 ///
@@ -160,8 +190,13 @@ async fn run_once(
         tx.send(WatchEvent::Deleted(id)).ok();
     }
 
+    let mut recent = RecentEvents::default();
+
     while let Some(event) = stream.next().await {
         let event = event?;
+        if !recent.first_sighting(&event) {
+            continue;
+        }
         let Some(action) = action(&event.metadata) else {
             continue;
         };
@@ -333,5 +368,42 @@ mod tests {
             known.get("sb-border").map(String::as_str),
             Some("id-border")
         );
+    }
+
+    fn event(timestamp: &str, action: &str) -> LxdEvent {
+        LxdEvent {
+            timestamp: timestamp.to_string(),
+            type_: "lifecycle".to_string(),
+            metadata: json!({"action": action, "name": "sb-5"}),
+        }
+    }
+
+    #[test]
+    fn drops_repeated_events() {
+        let mut recent = RecentEvents::default();
+        let shutdown = event("2026-09-13T15:56:55.230810123Z", "instance-shutdown");
+
+        assert!(recent.first_sighting(&shutdown));
+        assert!(!recent.first_sighting(&shutdown));
+        // Same instance and action at another time is a new event, and so is
+        // another action at the same time.
+        assert!(recent.first_sighting(&event(
+            "2026-09-13T15:57:01.000000000Z",
+            "instance-shutdown"
+        )));
+        assert!(recent.first_sighting(&event("2026-09-13T15:56:55.230810123Z", "instance-stopped")));
+    }
+
+    #[test]
+    fn remembers_a_bounded_number_of_events() {
+        let mut recent = RecentEvents::default();
+        let first = event("t-0", "instance-started");
+        assert!(recent.first_sighting(&first));
+        for i in 1..=RECENT_EVENTS {
+            assert!(recent.first_sighting(&event(&format!("t-{i}"), "instance-started")));
+        }
+        assert_eq!(recent.keys.len(), RECENT_EVENTS);
+        // Long gone, so no longer recognized.
+        assert!(recent.first_sighting(&first));
     }
 }
