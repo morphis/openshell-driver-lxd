@@ -36,9 +36,12 @@ set -euo pipefail
 # --- Pins --------------------------------------------------------------------
 
 # The release's Python SDK, which ships the generated protobuf modules the
-# source tree lacks.
+# source tree lacks. Releases without a published SDK build it from source:
+# the protobuf modules are generated with GRPCIO_TOOLS_VERSION and the package
+# is installed under SDK_SOURCE_VERSION.
 SDK_WHEEL="openshell-${OPENSHELL_VERSION}-py3-none-any.whl"
-SDK_WHEEL_SHA256="5a31eb4e38d7b5d746956404145b7335557f9060ac7a987c65ea5af4d708b3fc"
+GRPCIO_TOOLS_VERSION="1.83.1"
+SDK_SOURCE_VERSION="${OPENSHELL_VERSION/-pre./rc}"
 
 # A standalone uv, so no system Python packaging tools are needed.
 UV_VERSION="0.12.13"
@@ -99,17 +102,6 @@ require_e2e_tools() {
         || die "python3 >= 3.11 is required"
 }
 
-fetch_source() {
-    [ -f "${SOURCE_DIR}/e2e/rust/Cargo.toml" ] && return
-    log "fetching OpenShell source at v${OPENSHELL_VERSION} (${OPENSHELL_SOURCE_REV})"
-    rm -rf "$SOURCE_DIR"
-    mkdir -p "$SOURCE_DIR"
-    git -C "$SOURCE_DIR" init --quiet
-    git -C "$SOURCE_DIR" fetch --quiet --depth 1 "$OPENSHELL_REPO" "$OPENSHELL_SOURCE_REV"
-    git -C "$SOURCE_DIR" checkout --quiet FETCH_HEAD
-    rm -rf "${SOURCE_DIR}/.git"
-}
-
 build_rust_tests() {
     log "building upstream Rust e2e tests"
     (
@@ -138,18 +130,41 @@ fetch_uv() {
     rm -f "${UV_DIR}/${archive}"
 }
 
+uv() {
+    UV_CACHE_DIR="${CACHE_DIR}/uv-cache" "${UV_DIR}/uv" "$@"
+}
+
+# The SDK package to install: the release's wheel, or the source tree with its
+# protobuf modules generated.
+sdk_package() {
+    if [ "$OPENSHELL_BUILD" = "release" ]; then
+        mkdir -p "$OPENSHELL_DIR"
+        fetch_release_asset "$SDK_WHEEL" "$SDK_WHEEL_SHA256"
+        echo "${OPENSHELL_DIR}/${SDK_WHEEL}"
+        return
+    fi
+    local generator="${CACHE_DIR}/python-proto-generator"
+    log "generating the Python SDK's protobuf modules"
+    rm -rf "$generator"
+    uv venv --quiet --python python3 "$generator"
+    VIRTUAL_ENV="$generator" uv pip install --quiet "grpcio-tools==${GRPCIO_TOOLS_VERSION}"
+    (cd "$SOURCE_DIR" && "${generator}/bin/python" tasks/scripts/generate_python_proto.py) >&2
+    rm -rf "$generator"
+    echo "$SOURCE_DIR"
+}
+
 setup_python() {
     [ -x "${VENV_DIR}/bin/pytest" ] && return
     fetch_uv
-    mkdir -p "$OPENSHELL_DIR"
-    fetch_release_asset "$SDK_WHEEL" "$SDK_WHEEL_SHA256"
-    local wheel="${OPENSHELL_DIR}/${SDK_WHEEL}"
+    local package
+    package="$(sdk_package)"
 
     log "creating Python test environment"
     rm -rf "$VENV_DIR"
-    UV_CACHE_DIR="${CACHE_DIR}/uv-cache" "${UV_DIR}/uv" venv --quiet --python python3 "$VENV_DIR"
-    UV_CACHE_DIR="${CACHE_DIR}/uv-cache" VIRTUAL_ENV="$VENV_DIR" \
-        "${UV_DIR}/uv" pip install --quiet "$wheel" "${PYTHON_TEST_REQUIREMENTS[@]}"
+    uv venv --quiet --python python3 "$VENV_DIR"
+    # A source tree has no version metadata; name the release it is.
+    SETUPTOOLS_SCM_PRETEND_VERSION="$SDK_SOURCE_VERSION" VIRTUAL_ENV="$VENV_DIR" \
+        uv pip install --quiet "$package" "${PYTHON_TEST_REQUIREMENTS[@]}"
 }
 
 # The CLI's gateway config and state stay in the work dir, as for the
@@ -200,7 +215,7 @@ cmd_e2e() {
     require_e2e_tools
     ensure_not_running
     fetch_openshell
-    fetch_source
+    fetch_openshell_source
     build_rust_tests
     setup_python
 

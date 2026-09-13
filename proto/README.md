@@ -10,7 +10,8 @@ time via `tonic-prost-build`.
 
 It is vendored at the newest OpenShell release the driver targets, currently
 `v0.1.0-pre.1`. Its changes over `v0.0.116` are additive, so the driver serves
-both releases' gateways.
+both releases' gateways; the upstream test suites run against either (see
+`scripts/openshell-env.sh`).
 
 To update: `make sync-proto OPENSHELL_REF=<tag>` copies `compute_driver.proto`
 and `options.proto` from that upstream tag and builds the workspace to

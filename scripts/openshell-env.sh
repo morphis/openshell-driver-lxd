@@ -27,26 +27,51 @@
 #   OPENSHELL_TEST_WORK_DIR   state, logs and artifacts (default: target/openshell-test)
 #   OPENSHELL_TEST_CACHE_DIR  downloads and builds (default: target/openshell-test-cache)
 #   OPENSHELL_TEST_PROJECT    LXD project to run in (default: openshell-test)
+#   OPENSHELL_TEST_VERSION    OpenShell release: 0.0.116 (default, downloaded) or
+#                             0.1.0-pre.1 (built from source; needs libz3-dev)
 
 set -euo pipefail
 
 # --- Pins --------------------------------------------------------------------
 
-# Bump the release here and in `OPENSHELL_REF` in the Makefile together, so
-# the vendored proto matches the gateway the suites run against.
-OPENSHELL_VERSION="0.0.116"
+# The OpenShell release the suites run against. The vendored proto
+# (`OPENSHELL_REF` in the Makefile) is the newest of these; its changes are
+# additive, so the driver serves every release listed here.
+OPENSHELL_VERSION="${OPENSHELL_TEST_VERSION:-0.0.116}"
 OPENSHELL_REPO="https://github.com/NVIDIA/OpenShell"
 OPENSHELL_RELEASE_URL="${OPENSHELL_REPO}/releases/download/v${OPENSHELL_VERSION}"
-# The commit the release tag points to, for suites that need the source.
-# shellcheck disable=SC2034  # used by the suites that source this file
-OPENSHELL_SOURCE_REV="d1155aa70042d3e2ee49dbfa15346b108b7c1d92"
-GATEWAY_SHA256_X86_64="59c6da724eae7a00c28826f9191efbdf4fbaa5c768afdc8dea6a80a949ebcc89"
-GATEWAY_SHA256_AARCH64="292c379193a339220234ffea585350901468bb8f4076e2076bc074e8ed18974b"
-CLI_SHA256_X86_64="4fb4476d80a1875a0b83547ec3aba999cf0a2e2d75f95f2f709b622e2103520e"
-CLI_SHA256_AARCH64="7a949c48d1e000cd280869eea1e203e24816b9cfefc575b68a8b72b939cb3f43"
+
+case "$OPENSHELL_VERSION" in
+    0.0.116)
+        # Published release: gateway, CLI and Python SDK are downloaded and
+        # verified by checksum.
+        OPENSHELL_BUILD="release"
+        # shellcheck disable=SC2034  # used by scripts/upstream-e2e.sh
+        SDK_WHEEL_SHA256="5a31eb4e38d7b5d746956404145b7335557f9060ac7a987c65ea5af4d708b3fc"
+        GATEWAY_SHA256_X86_64="59c6da724eae7a00c28826f9191efbdf4fbaa5c768afdc8dea6a80a949ebcc89"
+        GATEWAY_SHA256_AARCH64="292c379193a339220234ffea585350901468bb8f4076e2076bc074e8ed18974b"
+        CLI_SHA256_X86_64="4fb4476d80a1875a0b83547ec3aba999cf0a2e2d75f95f2f709b622e2103520e"
+        CLI_SHA256_AARCH64="7a949c48d1e000cd280869eea1e203e24816b9cfefc575b68a8b72b939cb3f43"
+        # The commit the release tag points to, for suites that need the source.
+        OPENSHELL_SOURCE_REV="d1155aa70042d3e2ee49dbfa15346b108b7c1d92"
+        SUPERVISOR_DIGEST="sha256:c8c42aef16c200063e32cbf72e553e4ead027085427b555efafd95063ecead42"
+        ;;
+    0.1.0-pre.1)
+        # A tag with a published supervisor image but no release binaries:
+        # the gateway, CLI and Python SDK are built from the tagged source.
+        OPENSHELL_BUILD="source"
+        OPENSHELL_SOURCE_REV="f54a7a617760295cc101d6ec7f31df1dba50fc23"
+        SUPERVISOR_DIGEST="sha256:807f7f867710c1639d7faadaf534d296283c54fcc3329942429f4892c9c7d882"
+        ;;
+    *)
+        printf 'error: unsupported OPENSHELL_TEST_VERSION %s (supported: 0.0.116, 0.1.0-pre.1)\n' \
+            "$OPENSHELL_VERSION" >&2
+        exit 1
+        ;;
+esac
 
 # The supervisor released with the gateway, pinned by index digest.
-SUPERVISOR_IMAGE="ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_VERSION}@sha256:c8c42aef16c200063e32cbf72e553e4ead027085427b555efafd95063ecead42"
+SUPERVISOR_IMAGE="ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_VERSION}@${SUPERVISOR_DIGEST}"
 
 # --- Layout ------------------------------------------------------------------
 
@@ -108,7 +133,50 @@ fetch_release_asset() {
     esac
 }
 
+# The OpenShell source at OPENSHELL_SOURCE_REV, shared with the suites that
+# build from it.
+fetch_openshell_source() {
+    local dir="${CACHE_DIR}/openshell-src-${OPENSHELL_SOURCE_REV}"
+    [ -f "${dir}/Cargo.toml" ] && return
+    log "fetching OpenShell source at v${OPENSHELL_VERSION} (${OPENSHELL_SOURCE_REV})"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    git -C "$dir" init --quiet
+    git -C "$dir" fetch --quiet --depth 1 "$OPENSHELL_REPO" "$OPENSHELL_SOURCE_REV"
+    git -C "$dir" checkout --quiet FETCH_HEAD
+    rm -rf "${dir}/.git"
+}
+
+# Builds the gateway and CLI from source for a release that publishes no
+# binaries. Only the two binaries are kept; the build tree runs to several
+# GiB. The gateway links the system Z3 library (libz3-dev on Debian/Ubuntu).
+build_openshell() {
+    [ -x "$GATEWAY_BIN" ] && [ -x "$CLI_BIN" ] && return
+    ldconfig -p 2>/dev/null | grep -q 'libz3\.so ' \
+        || die "building OpenShell ${OPENSHELL_VERSION} needs the Z3 development library (apt install libz3-dev)"
+    fetch_openshell_source
+    local target="${CACHE_DIR}/openshell-build-target"
+    log "building OpenShell ${OPENSHELL_VERSION} gateway and CLI from source (several minutes on a cold cache)"
+    (
+        cd "${CACHE_DIR}/openshell-src-${OPENSHELL_SOURCE_REV}"
+        # Upstream pins its own toolchain; build with ours, so a
+        # rustup-managed cargo does not download a second toolchain.
+        RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}" CARGO_TARGET_DIR="$target" \
+            cargo build --quiet --release --locked \
+            -p openshell-server --bin openshell-gateway \
+            -p openshell-cli --bin openshell </dev/null
+    )
+    mkdir -p "$OPENSHELL_DIR"
+    install -m 0755 "${target}/release/openshell-gateway" "$GATEWAY_BIN"
+    install -m 0755 "${target}/release/openshell" "$CLI_BIN"
+    rm -rf "$target"
+}
+
 fetch_openshell() {
+    if [ "$OPENSHELL_BUILD" = "source" ]; then
+        build_openshell
+        return
+    fi
     mkdir -p "$OPENSHELL_DIR"
     case "$(uname -m)" in
         x86_64)
@@ -168,7 +236,7 @@ write_gateway_config() {
     echo "openshell-test" >"${keys}/kid"
     chmod 600 "${keys}/signing.pem"
 
-    # Schema version 1 is what v0.0.116 accepts. Without gateway_jwt the
+    # Schema version 1 is what v0.0.116 and v0.1.0-pre.1 accept. Without gateway_jwt the
     # gateway mints no sandbox token and the supervisor cannot connect.
     cat >"${WORK_DIR}/gateway.toml" <<EOF
 [openshell]

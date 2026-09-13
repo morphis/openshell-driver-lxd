@@ -80,7 +80,7 @@ proto:
 UPSTREAM_PROTOS := compute_driver.proto options.proto
 
 # OpenShell release the vendored protos are taken from: the newest release the
-# driver targets.
+# test suites in scripts/openshell-env.sh can run against.
 OPENSHELL_REF ?= v0.1.0-pre.1
 
 # Sync proto/ with upstream NVIDIA/OpenShell at $(OPENSHELL_REF).

@@ -108,9 +108,9 @@ gateway so you can create a sandbox end-to-end.
 4. **Start an OpenShell gateway pointed at the driver's socket**, using the
    out-of-tree driver flags. The gateway must be able to mint sandbox tokens
    (`gateway_jwt`), or every supervisor exits with "no sandbox token source
-   available". This is for OpenShell v0.0.116 (config schema `version = 1`
-   and `--drivers`; later gateways use `version = 2` and
-   `--compute-driver`):
+   available". This is for OpenShell v0.0.116 and v0.1.0-pre.1 (config
+   schema `version = 1` and `--drivers`; upstream `main` has moved to
+   `version = 2` and `--compute-driver`):
 
    ```sh
    cat > /tmp/openshell-gateway.toml <<EOF
@@ -415,12 +415,24 @@ local LXD, the way upstream validates its in-tree drivers:
 
 Both this and `make test-upstream-e2e` below run in the environment
 `scripts/openshell-env.sh` provides. It pins the OpenShell side to one
-release — gateway, CLI and supervisor image from v0.0.116, verified by
-checksum and digest — because mixing components from different releases
-fails in ways that are not the driver's, and runs everything in a throwaway
-LXD project (`openshell-test`) that shares the default project's image cache.
-The conformance runner is built from the newest upstream revision the pinned
-CLI can drive.
+release — gateway, CLI and supervisor image from the same release, the
+supervisor pinned by digest — because mixing components from different
+releases fails in ways that are not the driver's, and runs everything in a
+throwaway LXD project (`openshell-test`) that shares the default project's
+image cache. The conformance runner is built from the newest upstream
+revision the pinned CLI can drive.
+
+`OPENSHELL_TEST_VERSION` picks the release:
+
+- `0.0.116` (default): the latest stable release. Its gateway, CLI and Python
+  SDK are downloaded and verified by checksum.
+- `0.1.0-pre.1`: the release whose driver contract the vendored proto
+  follows. It publishes a supervisor image but no binaries, so the gateway,
+  CLI and Python SDK are built from the tagged source — several minutes and a
+  few GiB of scratch on a cold cache, and the gateway needs the Z3
+  development library (`apt install libz3-dev`).
+
+For example: `OPENSHELL_TEST_VERSION=0.1.0-pre.1 make test-conformance`.
 
 On failure, the driver and gateway logs and LXD's lifecycle events are left
 in `target/openshell-test/artifacts`, with each suite's reports in a
@@ -433,7 +445,7 @@ network policy, SSRF protections, credential handling, live policy updates,
 Landlock filesystem rules and `inference.local` routing. The supervisor
 enforces all of this, but only as far as the container lets it, and a sandbox
 that silently enforces nothing still passes smoke. The tests come from the
-v0.0.116 source tree (the Rust tests of `e2e/rust` and the Python tests of
+release's source tree (the Rust tests of `e2e/rust` and the Python tests of
 `e2e/python`, run through the release's Python SDK); upstream tests specific
 to the Docker or Podman drivers are left out. It additionally needs rootless
 podman (with `uidmap` and `passt`) for a test fixture server, and
