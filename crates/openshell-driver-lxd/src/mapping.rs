@@ -36,22 +36,31 @@ pub(crate) const ENV_MAIN_PROCESS_SPEC: &str = "OPENSHELL_MAIN_PROCESS_SPEC";
 const MAIN_PROCESS_SPEC_VERSION: u32 = 1;
 
 /// Encodes the sandbox's main process for [`ENV_MAIN_PROCESS_SPEC`]:
-/// `{"version":1,"command":[...],"tty":bool}`, the JSON form upstream's
-/// `MainProcessConfig` decodes.
+/// `{"version":1,"command":[...],"tty":bool,"await_main_process_attachment":bool}`,
+/// the JSON form upstream's `MainProcessConfig` decodes.
 ///
 /// An empty command means the supervisor's default interactive shell — the
 /// same fallback upstream applies — because the supervisor rejects a spec
-/// whose command is empty.
+/// whose command is empty. `await_main_process_attachment` (OpenShell
+/// v0.1.0-pre.1) tells the supervisor that the creating client will attach to
+/// the command, and is only passed with a requested command, as upstream's
+/// `MainProcessConfig::from_driver_spec` does; the v0.0.116 supervisor ignores
+/// the field.
 pub fn main_process_spec(spec: &DriverSandboxSpec) -> String {
-    let (command, tty) = if spec.command.is_empty() {
-        (vec!["/bin/bash".to_string(), "-l".to_string()], true)
+    let (command, tty, await_attachment) = if spec.command.is_empty() {
+        (vec!["/bin/bash".to_string(), "-l".to_string()], true, false)
     } else {
-        (spec.command.clone(), spec.tty)
+        (
+            spec.command.clone(),
+            spec.tty,
+            spec.await_main_process_attachment,
+        )
     };
     serde_json::json!({
         "version": MAIN_PROCESS_SPEC_VERSION,
         "command": command,
         "tty": tty,
+        "await_main_process_attachment": await_attachment,
     })
     .to_string()
 }
@@ -1052,6 +1061,7 @@ mod tests {
                 "printf '%s\\n' \"quoted $VAR\" > /sandbox/out; echo ünïcode".to_string(),
             ],
             tty: false,
+            await_main_process_attachment: true,
             ..Default::default()
         };
 
@@ -1071,6 +1081,7 @@ mod tests {
                 "version": 1,
                 "command": spec.command,
                 "tty": false,
+                "await_main_process_attachment": true,
             })
         );
     }
@@ -1079,9 +1090,14 @@ mod tests {
     /// interactive login shell when no spec is given; match that.
     #[test]
     fn empty_command_is_the_default_login_shell() {
+        // Nothing attaches to a shell nobody asked for, whatever the hint says.
+        let spec = DriverSandboxSpec {
+            await_main_process_attachment: true,
+            ..Default::default()
+        };
         let config = build_create_config(
             &identified_sandbox(),
-            &DriverSandboxSpec::default(),
+            &spec,
             &DriverSandboxTemplate::default(),
             "",
             false,
@@ -1095,6 +1111,7 @@ mod tests {
                 "version": 1,
                 "command": ["/bin/bash", "-l"],
                 "tty": true,
+                "await_main_process_attachment": false,
             })
         );
     }

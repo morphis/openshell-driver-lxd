@@ -79,10 +79,9 @@ proto:
 # be resolvable on protoc's include path for codegen to succeed.
 UPSTREAM_PROTOS := compute_driver.proto options.proto
 
-# OpenShell release the vendored protos are taken from. Keep it in step with
-# the release pinned in scripts/openshell-env.sh, which the test suites run
-# against.
-OPENSHELL_REF ?= v0.0.116
+# OpenShell release the vendored protos are taken from: the newest release the
+# driver targets.
+OPENSHELL_REF ?= v0.1.0-pre.1
 
 # Sync proto/ with upstream NVIDIA/OpenShell at $(OPENSHELL_REF).
 sync-proto:

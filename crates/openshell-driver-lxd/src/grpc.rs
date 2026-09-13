@@ -8,8 +8,9 @@ use std::pin::Pin;
 use computev1::pb::compute_driver_server::ComputeDriver;
 use computev1::pb::DriverSandbox;
 use computev1::pb::{
-    watch_sandboxes_event, CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest,
-    DeleteSandboxResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
+    watch_sandboxes_event, AuthenticateSandboxRequest, AuthenticateSandboxResponse,
+    CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
     EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse,
     GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
     GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
@@ -93,6 +94,22 @@ impl ComputeDriver for ComputeDriverService {
         _request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         Ok(Response::new(self.driver.capabilities()))
+    }
+
+    /// The driver delivers each sandbox its gateway-minted token itself, so
+    /// there is no platform credential to exchange for one — as with
+    /// upstream's Docker, Podman and VM drivers; only Kubernetes verifies
+    /// service-account tokens. Capabilities say so
+    /// (`supports_sandbox_authentication: false`), and the gateway does not
+    /// call this.
+    async fn authenticate_sandbox(
+        &self,
+        _request: Request<AuthenticateSandboxRequest>,
+    ) -> Result<Response<AuthenticateSandboxResponse>, Status> {
+        Err(
+            DriverError::Unimplemented("the LXD driver does not authenticate sandbox credentials")
+                .into(),
+        )
     }
 
     /// Asks the gateway for a sandbox-callback listener when one is
@@ -433,6 +450,25 @@ mod tests {
             Some(Selector::ExactBindAddress("169.254.17.1:17670".to_string()))
         );
         assert!(!response.requirements[0].reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sandbox_authentication_is_declined_and_advertised_as_such() {
+        let service = service();
+        let status = service
+            .authenticate_sandbox(Request::new(AuthenticateSandboxRequest {
+                credential: "anything".to_string(),
+            }))
+            .await
+            .expect_err("the driver has no sandbox credentials to verify");
+        assert_eq!(status.code(), Code::Unimplemented);
+
+        let capabilities = service
+            .get_capabilities(Request::new(GetCapabilitiesRequest {}))
+            .await
+            .expect("capabilities")
+            .into_inner();
+        assert!(!capabilities.supports_sandbox_authentication);
     }
 
     #[tokio::test]

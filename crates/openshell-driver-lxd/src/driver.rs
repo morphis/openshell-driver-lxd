@@ -223,6 +223,9 @@ impl LxdComputeDriver {
             // across gateway restarts instead; StartSandbox is only for
             // sandboxes that were stopped.
             gateway_manages_lifecycle: false,
+            // Sandboxes get their gateway token from the driver; there is no
+            // platform credential for AuthenticateSandbox to verify.
+            supports_sandbox_authentication: false,
         }
     }
 

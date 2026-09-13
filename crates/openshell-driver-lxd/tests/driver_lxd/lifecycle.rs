@@ -268,7 +268,12 @@ async fn requested_command_reaches_the_supervisor() {
         serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"));
     assert_eq!(
         decoded,
-        serde_json::json!({"version": 1, "command": command, "tty": false})
+        serde_json::json!({
+            "version": 1,
+            "command": command,
+            "tty": false,
+            "await_main_process_attachment": false,
+        })
     );
 }
 

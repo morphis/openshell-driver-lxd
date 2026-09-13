@@ -8,10 +8,9 @@ compute drivers implement.
 `crates/computev1` generates tonic/prost bindings from this file at build
 time via `tonic-prost-build`.
 
-It is vendored at the OpenShell release the driver targets, currently
-`v0.0.116`, the same release the upstream test suites run against (pinned in
-`scripts/openshell-env.sh`), so the driver implements exactly the contract of
-the gateway it is tested with.
+It is vendored at the newest OpenShell release the driver targets, currently
+`v0.1.0-pre.1`. Its changes over `v0.0.116` are additive, so the driver serves
+both releases' gateways.
 
 To update: `make sync-proto OPENSHELL_REF=<tag>` copies `compute_driver.proto`
 and `options.proto` from that upstream tag and builds the workspace to
