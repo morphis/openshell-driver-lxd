@@ -436,10 +436,16 @@ async fn invalid_creates_are_rejected_without_leftovers() {
         fields: BTreeMap::from([("network".to_string(), string_value("odl-no-such-net"))]),
     });
 
+    let mut bad_pool = sandbox(&unique_name("badpool"));
+    template_mut(&mut bad_pool).driver_config = Some(Struct {
+        fields: BTreeMap::from([("storage_pool".to_string(), string_value("odl-no-such-pool"))]),
+    });
+
     for (request, code) in [
         (bad_label, Code::InvalidArgument),
         (bad_quantity, Code::InvalidArgument),
-        (bad_network, Code::NotFound),
+        (bad_network, Code::FailedPrecondition),
+        (bad_pool, Code::FailedPrecondition),
     ] {
         let name = request.name.clone();
         let _cleanup = driver.cleanup(&[&name]);

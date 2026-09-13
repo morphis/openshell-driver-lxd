@@ -33,7 +33,7 @@ the `openshell` CLI driving them below.
 
 - Rust (stable, see `rust-toolchain.toml`)
 - `protoc` (`apt install protobuf-compiler libprotobuf-dev`) for `computev1`'s proto codegen
-- [LXD](https://github.com/canonical/lxd), initialized with a `default` storage pool and an `lxdbr0` network
+- [LXD](https://github.com/canonical/lxd) with a storage pool and a managed network for sandboxes — `default` and `lxdbr0` unless set with `--default-storage-pool` and `--default-network` (see [Networks and Storage Pools](#networks-and-storage-pools))
 - `skopeo`, `umoci`, and `mksquashfs` (`apt install skopeo umoci squashfs-tools`) — the driver uses these to pull and import sandbox OCI images into LXD on demand
 - `busybox-static` or `udhcpc` (`apt install busybox-static`) — provides the fallback DHCP client for guest containers
 
@@ -176,6 +176,24 @@ gateway so you can create a sandbox end-to-end.
   with the gateway finishing the sandbox record, say — otherwise leaves the
   instance `Stopped` with nothing to bring it back: LXD's `boot.autorestart`
   is VM-only and `boot.autostart` only covers daemon restarts.
+
+## Networks and Storage Pools
+
+Every sandbox gets a NIC on one LXD network and its root disk on one storage
+pool. The operator sets where sandboxes go by default, so users creating
+sandboxes need not know how the LXD behind the gateway is laid out:
+
+- `--default-network` (default `lxdbr0`): the network sandboxes attach to.
+  On MicroCloud this is usually the OVN network `default`.
+- `--default-storage-pool` (default `default`): the pool for root disks. On
+  MicroCloud this is usually `local` or `remote`.
+
+A request can still choose per sandbox with `driver_config.network` and
+`driver_config.storage_pool` (for example
+`openshell sandbox create --driver-config-json '{"lxd":{"storage_pool":"remote"}}'`).
+A create naming a network or pool that does not exist in the driver's
+project fails straight away with `FailedPrecondition`, before any image is
+imported.
 
 ## Images and Caching
 

@@ -19,8 +19,6 @@ const KEY_NAMESPACE: &str = "user.openshell.namespace";
 const KEY_WORKSPACE: &str = "user.openshell.workspace";
 const LABEL_PREFIX: &str = "user.openshell.label.";
 const ENV_PREFIX: &str = "environment.";
-const DEFAULT_STORAGE_POOL: &str = "default";
-const DEFAULT_NETWORK: &str = "lxdbr0";
 
 /// Identifies the guest-side path where the token file is bind-mounted.
 /// The supervisor finds it via `OPENSHELL_SANDBOX_TOKEN_FILE`.
@@ -384,11 +382,11 @@ fn max_processes(template: &DriverSandboxTemplate) -> Option<u32> {
 }
 
 /// Builds the LXD `devices` map for `POST /1.0/instances`: a root disk on
-/// the configured (or default) storage pool, a NIC on the configured (or
-/// default) network, a read-only supervisor disk volume, a read-only DHCP client
-/// disk volume, and an optional GPU device.
+/// the placement's storage pool, a NIC on its network, a read-only supervisor
+/// disk volume, a read-only DHCP client disk volume, and an optional GPU
+/// device.
 pub fn build_create_devices(
-    template: &DriverSandboxTemplate,
+    placement: Placement<'_>,
     gpu: bool,
     supervisor_pool: &str,
     supervisor_volume: &str,
@@ -399,13 +397,13 @@ pub fn build_create_devices(
 
     let mut root = HashMap::new();
     root.insert("type".to_string(), "disk".to_string());
-    root.insert("pool".to_string(), storage_pool(template).to_string());
+    root.insert("pool".to_string(), placement.storage_pool.to_string());
     root.insert("path".to_string(), "/".to_string());
     devices.insert("root".to_string(), root);
 
     let mut eth0 = HashMap::new();
     eth0.insert("type".to_string(), "nic".to_string());
-    eth0.insert("network".to_string(), network(template).to_string());
+    eth0.insert("network".to_string(), placement.network.to_string());
     devices.insert("eth0".to_string(), eth0);
 
     let mut supervisor = HashMap::new();
@@ -445,20 +443,34 @@ pub fn build_profiles(template: &DriverSandboxTemplate) -> Vec<String> {
     profiles
 }
 
-/// Returns the LXD network a sandbox's NIC attaches to: `driver_config.network`,
-/// defaulting to `lxdbr0`.
-pub fn network(template: &DriverSandboxTemplate) -> &str {
-    struct_get_str(template.driver_config.as_ref(), "network").unwrap_or(DEFAULT_NETWORK)
+/// Where a sandbox lives in LXD: the network its NIC attaches to and the
+/// storage pool its root disk is on.
+///
+/// The storage pool also places the supervisor and DHCP-client volumes, so
+/// those auxiliary volumes land on the same pool as the rootfs they attach to
+/// unless the operator pins them with `--supervisor-storage-pool`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement<'a> {
+    pub network: &'a str,
+    pub storage_pool: &'a str,
 }
 
-/// Returns the LXD storage pool a sandbox's root disk lives on:
-/// `driver_config.storage_pool`, defaulting to `default`.
-///
-/// Also used to place the supervisor and DHCP-client volumes, so those
-/// auxiliary volumes land on the same pool as the rootfs they attach to
-/// unless the operator pins them with `--supervisor-storage-pool`.
-pub(crate) fn storage_pool(template: &DriverSandboxTemplate) -> &str {
-    struct_get_str(template.driver_config.as_ref(), "storage_pool").unwrap_or(DEFAULT_STORAGE_POOL)
+impl<'a> Placement<'a> {
+    /// The request's `driver_config.network` and `driver_config.storage_pool`,
+    /// each falling back to the driver's configured default when unset, so
+    /// users need not know how the LXD behind the gateway is laid out.
+    pub fn resolve(
+        template: &'a DriverSandboxTemplate,
+        default_network: &'a str,
+        default_storage_pool: &'a str,
+    ) -> Self {
+        let driver_config = template.driver_config.as_ref();
+        Self {
+            network: struct_get_str(driver_config, "network").unwrap_or(default_network),
+            storage_pool: struct_get_str(driver_config, "storage_pool")
+                .unwrap_or(default_storage_pool),
+        }
+    }
 }
 
 pub(crate) fn is_valid_label_key(key: &str) -> bool {
@@ -494,6 +506,11 @@ mod tests {
 
     use super::*;
 
+    const DEFAULTS: Placement<'static> = Placement {
+        network: "lxdbr0",
+        storage_pool: "default",
+    };
+
     #[test]
     fn test_dhcp_client_volume_name() {
         assert_eq!(
@@ -508,14 +525,8 @@ mod tests {
 
     #[test]
     fn build_create_devices_omits_gpu_by_default() {
-        let devices = build_create_devices(
-            &DriverSandboxTemplate::default(),
-            false,
-            "default",
-            "vol1",
-            "default",
-            "dhcp-vol1",
-        );
+        let devices =
+            build_create_devices(DEFAULTS, false, "default", "vol1", "default", "dhcp-vol1");
 
         assert!(!devices.contains_key("gpu0"));
         assert!(devices.contains_key("root"));
@@ -526,14 +537,8 @@ mod tests {
 
     #[test]
     fn build_create_devices_attaches_gpu_when_requested() {
-        let devices = build_create_devices(
-            &DriverSandboxTemplate::default(),
-            true,
-            "default",
-            "vol1",
-            "default",
-            "dhcp-vol1",
-        );
+        let devices =
+            build_create_devices(DEFAULTS, true, "default", "vol1", "default", "dhcp-vol1");
 
         let gpu0 = devices.get("gpu0").expect("gpu0 device should be present");
         assert_eq!(gpu0.get("type"), Some(&"gpu".to_string()));
@@ -546,7 +551,7 @@ mod tests {
         let sup_vol_name = supervisor_volume_name(digest);
         let dhcp_vol_name = dhcp_client_volume_name(digest);
         let devices = build_create_devices(
-            &DriverSandboxTemplate::default(),
+            DEFAULTS,
             false,
             "custom-pool",
             &sup_vol_name,
@@ -1344,10 +1349,15 @@ mod tests {
     }
 
     #[test]
-    fn network_and_storage_pool_default_and_override() {
+    fn placement_defaults_and_override() {
         let defaults = DriverSandboxTemplate::default();
-        assert_eq!(network(&defaults), "lxdbr0");
-        assert_eq!(storage_pool(&defaults), "default");
+        assert_eq!(
+            Placement::resolve(&defaults, "ovn0", "local"),
+            Placement {
+                network: "ovn0",
+                storage_pool: "local",
+            }
+        );
 
         let custom = DriverSandboxTemplate {
             driver_config: driver_config(&[
@@ -1356,8 +1366,26 @@ mod tests {
             ]),
             ..Default::default()
         };
-        assert_eq!(network(&custom), "sandboxbr0");
-        assert_eq!(storage_pool(&custom), "fast");
+        assert_eq!(
+            Placement::resolve(&custom, "ovn0", "local"),
+            Placement {
+                network: "sandboxbr0",
+                storage_pool: "fast",
+            }
+        );
+
+        // Only one of them set: the other keeps the driver's default.
+        let pool_only = DriverSandboxTemplate {
+            driver_config: driver_config(&[("storage_pool", string_value("remote"))]),
+            ..Default::default()
+        };
+        assert_eq!(
+            Placement::resolve(&pool_only, "ovn0", "local"),
+            Placement {
+                network: "ovn0",
+                storage_pool: "remote",
+            }
+        );
 
         // Wrong types are ignored rather than half-applied.
         let wrong_types = DriverSandboxTemplate {
@@ -1377,21 +1405,23 @@ mod tests {
             ]),
             ..Default::default()
         };
-        assert_eq!(network(&wrong_types), "lxdbr0");
-        assert_eq!(storage_pool(&wrong_types), "default");
+        assert_eq!(
+            Placement::resolve(&wrong_types, "ovn0", "local"),
+            Placement {
+                network: "ovn0",
+                storage_pool: "local",
+            }
+        );
     }
 
     #[test]
-    fn devices_follow_driver_config_network_and_pool() {
-        let template = DriverSandboxTemplate {
-            driver_config: driver_config(&[
-                ("network", string_value("sandboxbr0")),
-                ("storage_pool", string_value("fast")),
-            ]),
-            ..Default::default()
+    fn devices_follow_placement() {
+        let placement = Placement {
+            network: "sandboxbr0",
+            storage_pool: "fast",
         };
 
-        let devices = build_create_devices(&template, false, "fast", "sup", "fast", "dhcp");
+        let devices = build_create_devices(placement, false, "fast", "sup", "fast", "dhcp");
 
         let root = devices.get("root").expect("root device");
         assert_eq!(root.get("pool").map(String::as_str), Some("fast"));

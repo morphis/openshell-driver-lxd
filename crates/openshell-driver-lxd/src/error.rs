@@ -15,6 +15,12 @@ pub enum DriverError {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// The request is valid but LXD is not set up to serve it, e.g. the
+    /// network or storage pool a sandbox is placed on does not exist. The
+    /// gateway shows these messages to the user as they are.
+    #[error("failed precondition: {0}")]
+    FailedPrecondition(String),
+
     /// The LXD REST API call failed.
     #[error("LXD error: {0}")]
     Lxd(#[from] LxdError),
@@ -44,6 +50,7 @@ impl From<DriverError> for Status {
         match err {
             DriverError::Unimplemented(msg) => Status::unimplemented(msg),
             DriverError::InvalidArgument(msg) => Status::invalid_argument(msg),
+            DriverError::FailedPrecondition(msg) => Status::failed_precondition(msg),
             DriverError::Lxd(LxdError::Api {
                 status_code,
                 message,
@@ -99,6 +106,10 @@ mod tests {
             (
                 DriverError::InvalidArgument("x".into()),
                 Code::InvalidArgument,
+            ),
+            (
+                DriverError::FailedPrecondition("x".into()),
+                Code::FailedPrecondition,
             ),
             (DriverError::NotFound("x".into()), Code::NotFound),
             (DriverError::Timeout, Code::DeadlineExceeded),

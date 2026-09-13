@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use computev1::pb::{DriverSandbox, DriverSandboxTemplate, GetCapabilitiesResponse};
+use computev1::pb::{DriverSandbox, GetCapabilitiesResponse};
 use lxd_client::{LxdClient, LxdError};
 use tokio::sync::Mutex;
 
@@ -248,8 +248,15 @@ impl LxdComputeDriver {
             DriverError::InvalidArgument("sandbox.spec.template is required".into())
         })?;
 
+        let placement = mapping::Placement::resolve(
+            template,
+            &self.config.default_network,
+            &self.config.default_storage_pool,
+        );
+        let network = self.check_placement(placement).await?;
+
         let has_token = !spec.sandbox_token.is_empty();
-        let gateway_endpoint = self.resolve_gateway_endpoint(template).await?;
+        let gateway_endpoint = self.resolve_gateway_endpoint(placement.network, &network)?;
         let config = mapping::build_create_config(
             sandbox,
             spec,
@@ -267,7 +274,7 @@ impl LxdComputeDriver {
             .config
             .supervisor_storage_pool
             .as_deref()
-            .unwrap_or_else(|| mapping::storage_pool(template));
+            .unwrap_or(placement.storage_pool);
 
         let gpu = spec
             .resource_requirements
@@ -350,7 +357,7 @@ impl LxdComputeDriver {
         }
 
         let devices = mapping::build_create_devices(
-            template,
+            placement,
             gpu.is_some(),
             aux_pool,
             &volume_name,
@@ -519,16 +526,50 @@ impl LxdComputeDriver {
         Ok(())
     }
 
+    /// Confirms that the network and storage pool a sandbox is placed on
+    /// exist, before anything slow (an image import) or anything that would
+    /// need cleaning up (volumes, the instance) happens. Returns the network.
+    ///
+    /// A missing one is a `FailedPrecondition` naming it and how to choose
+    /// another, which the gateway passes on to the user as is; LXD's own 404
+    /// ("Network not found") names neither.
+    async fn check_placement(
+        &self,
+        placement: mapping::Placement<'_>,
+    ) -> Result<lxd_client::Network, DriverError> {
+        let project = &self.config.project;
+        let network = match self.lxd.get_network(placement.network).await {
+            Ok(network) => network,
+            Err(LxdError::Api {
+                status_code: 404, ..
+            }) => {
+                return Err(DriverError::FailedPrecondition(format!(
+                    "LXD network {:?} does not exist in project {project:?}; set the sandbox's \
+                     driver_config.network or the driver's --default-network to an existing one",
+                    placement.network
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if !self.lxd.storage_pool_exists(placement.storage_pool).await? {
+            return Err(DriverError::FailedPrecondition(format!(
+                "LXD storage pool {:?} does not exist; set the sandbox's \
+                 driver_config.storage_pool or the driver's --default-storage-pool to an existing one",
+                placement.storage_pool
+            )));
+        }
+        Ok(network)
+    }
+
     /// Resolves `OPENSHELL_ENDPOINT` from the sandbox's own target network's
     /// host-side bridge IP and the configured gateway gRPC port.
-    async fn resolve_gateway_endpoint(
+    fn resolve_gateway_endpoint(
         &self,
-        template: &DriverSandboxTemplate,
+        network_name: &str,
+        network: &lxd_client::Network,
     ) -> Result<String, DriverError> {
-        let network_name = mapping::network(template);
-        let network = self.lxd.get_network(network_name).await?;
         let cidr = network.config.get("ipv4.address").ok_or_else(|| {
-            DriverError::InvalidArgument(format!(
+            DriverError::FailedPrecondition(format!(
                 "network {network_name:?} has no ipv4.address configured"
             ))
         })?;

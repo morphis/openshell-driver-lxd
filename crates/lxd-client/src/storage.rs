@@ -13,6 +13,18 @@ use crate::error::LxdError;
 use crate::types::Operation;
 
 impl LxdClient {
+    /// Checks whether a storage pool exists.
+    pub async fn storage_pool_exists(&self, pool: &str) -> Result<bool, LxdError> {
+        let path = format!("/1.0/storage-pools/{}", encode(pool));
+        match self.get::<serde_json::Value>(&path).await {
+            Ok(_) => Ok(true),
+            Err(LxdError::Api {
+                status_code: 404, ..
+            }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Checks whether a custom storage pool volume exists on the given pool.
     pub async fn storage_pool_volume_exists(
         &self,
