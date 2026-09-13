@@ -100,6 +100,12 @@ pub struct LxdHttpsConfig {
     /// Path to a PEM-encoded CA certificate to verify the server cert.
     /// `None` uses the webpki CA bundle.
     pub server_ca: Option<PathBuf>,
+    /// Path to the PEM-encoded certificate the server itself presents,
+    /// trusted exactly and whatever names it carries, as `lxc remote add`
+    /// does. LXD's self-signed certificates name only the host and loopback
+    /// addresses, so this is how an LXD reached by IP address is verified.
+    /// Takes precedence over `server_ca`.
+    pub server_cert: Option<PathBuf>,
 }
 
 impl LxdHttpsConfig {
@@ -175,6 +181,45 @@ impl LxdHttpsConfig {
                 reason: "no private key in PEM file".into(),
             })?;
 
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| LxdError::Tls {
+                reason: format!("TLS protocol error: {e}"),
+            })?;
+
+        if let Some(cert_path) = &self.server_cert {
+            let cert_file = File::open(cert_path).map_err(|e| LxdError::Tls {
+                reason: format!("cannot open server cert: {e}"),
+            })?;
+            let mut server_certs: Vec<CertificateDer<'static>> =
+                certs(&mut BufReader::new(cert_file))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| LxdError::Tls {
+                        reason: format!("invalid server cert PEM: {e}"),
+                    })?;
+            if server_certs.len() != 1 {
+                return Err(LxdError::Tls {
+                    reason: format!(
+                        "server cert file must hold exactly one certificate, found {}",
+                        server_certs.len()
+                    ),
+                });
+            }
+            let verifier = PinnedServerCert {
+                cert: server_certs.remove(0),
+                provider,
+            };
+            let tls_config = builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(verifier))
+                .with_client_auth_cert(client_certs, key)
+                .map_err(|e| LxdError::Tls {
+                    reason: format!("TLS cert error: {e}"),
+                })?;
+            return Ok(tokio_rustls::TlsConnector::from(Arc::new(tls_config)));
+        }
+
         let root_store = if let Some(ca_path) = &self.server_ca {
             let ca_file = File::open(ca_path).map_err(|e| LxdError::Tls {
                 reason: format!("cannot open server CA: {e}"),
@@ -197,20 +242,79 @@ impl LxdHttpsConfig {
             store
         };
 
-        let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| LxdError::Tls {
-            reason: format!("TLS protocol error: {e}"),
-        })?
-        .with_root_certificates(root_store)
-        .with_client_auth_cert(client_certs, key)
-        .map_err(|e| LxdError::Tls {
-            reason: format!("TLS cert error: {e}"),
-        })?;
+        let tls_config = builder
+            .with_root_certificates(root_store)
+            .with_client_auth_cert(client_certs, key)
+            .map_err(|e| LxdError::Tls {
+                reason: format!("TLS cert error: {e}"),
+            })?;
 
         Ok(tokio_rustls::TlsConnector::from(Arc::new(tls_config)))
+    }
+}
+
+/// Trusts exactly one server certificate, whatever names it carries.
+///
+/// The handshake signature is still checked against that certificate's key,
+/// so only a server holding its private key gets through. Names and validity
+/// dates are not checked — the certificate is identified by its bytes, as
+/// `lxc` does for the remotes it trusts.
+#[derive(Debug)]
+struct PinnedServerCert {
+    cert: rustls::pki_types::CertificateDer<'static>,
+    provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedServerCert {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if end_entity.as_ref() == self.cert.as_ref() {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -713,6 +817,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_server_cert_accepts_only_its_own_bytes() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+        let pinned = PinnedServerCert {
+            cert: CertificateDer::from(vec![1, 2, 3, 4]),
+            provider: std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+        };
+        // The name is ignored: LXD's certificate names the host, while the
+        // driver may dial it by address.
+        let name = ServerName::try_from("192.168.1.166").unwrap();
+
+        assert!(pinned
+            .verify_server_cert(
+                &CertificateDer::from(vec![1, 2, 3, 4]),
+                &[],
+                &name,
+                &[],
+                UnixTime::now()
+            )
+            .is_ok());
+        assert!(pinned
+            .verify_server_cert(
+                &CertificateDer::from(vec![1, 2, 3, 5]),
+                &[],
+                &name,
+                &[],
+                UnixTime::now()
+            )
+            .is_err());
+        assert!(!pinned.supported_verify_schemes().is_empty());
+    }
 
     fn test_client() -> LxdClient {
         LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from("/tmp/test.sock"))).unwrap()

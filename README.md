@@ -220,6 +220,19 @@ A create naming a network or pool that does not exist in the driver's
 project fails straight away with `FailedPrecondition`, before any image is
 imported.
 
+### Reaching a remote LXD
+
+With `--lxd-url https://<address>:8443` plus `--lxd-client-cert` and
+`--lxd-client-key` the driver talks to LXD over the network instead of its
+local socket. LXD's self-signed certificate names only the host's hostname
+and loopback addresses, so a server reached by IP address fails ordinary
+verification. Pass the certificate LXD presents with `--lxd-server-cert` to
+trust exactly that certificate, as `lxc remote add` does; on a cluster member
+such as a MicroCloud node that is `/var/snap/lxd/common/lxd/cluster.crt`.
+`--lxd-server-ca` instead verifies against a CA, including the host name. Trust
+the client certificate in LXD restricted to the driver's project:
+`lxc config trust add client.crt --restricted --projects <project>`.
+
 ### Reaching the gateway
 
 Each sandbox's supervisor connects back to the gateway at

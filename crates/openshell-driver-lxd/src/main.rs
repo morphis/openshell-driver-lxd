@@ -82,6 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             client_cert,
             client_key,
             server_ca: config.lxd_server_ca.clone(),
+            server_cert: config.lxd_server_cert.clone(),
         })
     } else {
         LxdEndpoint::UnixSocket(config.lxd_socket.clone())

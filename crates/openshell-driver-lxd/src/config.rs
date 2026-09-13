@@ -201,8 +201,15 @@ pub struct Config {
 
     /// PEM CA certificate to verify the remote LXD server cert.
     /// Omit to use the built-in webpki CA bundle.
-    #[arg(long, requires = "lxd_url")]
+    #[arg(long, requires = "lxd_url", conflicts_with = "lxd_server_cert")]
     pub lxd_server_ca: Option<PathBuf>,
+
+    /// PEM certificate the remote LXD presents, trusted exactly whatever
+    /// names it carries, as `lxc remote add` does. LXD's own certificate
+    /// names only its hostname and loopback, so use this to reach LXD by IP
+    /// address (on a cluster member, the file is `cluster.crt`).
+    #[arg(long, requires = "lxd_url")]
+    pub lxd_server_cert: Option<PathBuf>,
 
     /// gRPC port the gateway listens on, used to build OPENSHELL_ENDPOINT for
     /// sandboxes when --gateway-endpoint is unset. The host is then resolved
@@ -521,6 +528,27 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(plaintext_http.validate(), Ok(()));
+    }
+
+    #[test]
+    fn server_cert_pin_and_ca_are_alternatives() {
+        let remote = [
+            "--lxd-url",
+            "https://192.168.1.166:8443",
+            "--lxd-client-cert",
+            "/c",
+            "--lxd-client-key",
+            "/k",
+        ];
+        let mut pinned = remote.to_vec();
+        pinned.extend(["--lxd-server-cert", "/etc/openshell/lxd/server.crt"]);
+        assert!(parse(&pinned).is_ok());
+
+        let mut both = pinned.clone();
+        both.extend(["--lxd-server-ca", "/ca.crt"]);
+        assert!(parse(&both).is_err());
+
+        assert!(parse(&["--lxd-server-cert", "/s.crt"]).is_err());
     }
 
     #[test]
