@@ -257,7 +257,7 @@ impl LxdComputeDriver {
 
         let has_token = !spec.sandbox_token.is_empty();
         let gateway_endpoint = self.resolve_gateway_endpoint(placement.network, &network)?;
-        let config = mapping::build_create_config(
+        let mut config = mapping::build_create_config(
             sandbox,
             spec,
             template,
@@ -265,6 +265,10 @@ impl LxdComputeDriver {
             has_token,
             self.config.default_max_processes,
         )?;
+
+        if self.config.sandbox_nesting {
+            config.insert("security.nesting".to_string(), "true".to_string());
+        }
 
         // Auxiliary volumes live on the sandbox's own pool unless the
         // operator pinned them, so a request asking for a non-default

@@ -149,10 +149,11 @@ gateway so you can create a sandbox end-to-end.
   Sandboxes can reach each other and the network freely today. `lxd-client`
   has the Network ACL APIs needed to build this, but nothing in the driver
   calls them yet.
-- **`security.nesting=true` is the container's trust boundary.** This grants
-  the `userns` capability, relaxes `/proc/sys` and cgroup mount restrictions,
-  and allows AppArmor-stacking access — independent of
-  `security.privileged`, which is not set.
+- **`--sandbox-nesting` widens the container's trust boundary.** Sandboxes
+  are unprivileged and unnested by default. Nesting, for workloads that run
+  containers themselves, grants the `userns` capability, relaxes `/proc/sys`
+  and cgroup mount restrictions, and allows AppArmor-stacking access —
+  independent of `security.privileged`, which is never set.
 - **PID limits are enforced, other cgroup limits are not.** Every sandbox
   gets `limits.processes` (`--default-max-processes`, default 4096) so one
   sandbox cannot fork-bomb its co-tenants, but there is no I/O or PID-cgroup
@@ -216,10 +217,9 @@ gateway request (e.g. `docker://registry.example.com/org/sandbox:latest` or
 - **Init:** Conversion adds the driver's init script as `/openshell-init.sh`
   and points `/sbin/init` at it, replacing any init the image ships. LXD
   starts `/sbin/init` in a container, and the script sets up networking and
-  hands over to the supervisor. The driver sets no `raw.*` keys, so sandboxes
-  can run in a restricted project; one needs
-  `restricted.containers.nesting=allow`, as sandboxes set `security.nesting`
-  (see [Security limitations](#security-limitations)).
+  hands over to the supervisor. The driver sets no `raw.*` keys and, unless
+  `--sandbox-nesting` is given, no `security.nesting`, so sandboxes run in a
+  restricted project with its default restrictions.
 - **Tag mutation:** Because the cache is keyed on content digest rather than tag,
   if a tag points to a new digest, the driver will automatically pull and import the new
   image on first use.

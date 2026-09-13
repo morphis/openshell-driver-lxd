@@ -210,6 +210,14 @@ pub struct Config {
     #[arg(long, default_value_t = DEFAULT_GATEWAY_GRPC_PORT)]
     pub gateway_grpc_port: u16,
 
+    /// Set `security.nesting` on sandboxes, for workloads that run containers
+    /// themselves. The supervisor does not need it: its network namespace,
+    /// nftables rules and seccomp filter work without. Nesting relaxes the
+    /// container's AppArmor confinement, and a restricted project refuses it
+    /// unless `restricted.containers.nesting=allow`.
+    #[arg(long)]
+    pub sandbox_nesting: bool,
+
     /// Deadline, in seconds, to wait for an LXD operation to complete before
     /// failing the RPC with DeadlineExceeded.
     #[arg(long, default_value_t = DEFAULT_OPERATION_TIMEOUT_SECS)]

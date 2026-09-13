@@ -260,11 +260,6 @@ pub fn build_create_config(
     config.insert(KEY_SANDBOX_ID.to_string(), sandbox.id.clone());
     config.insert(KEY_NAMESPACE.to_string(), sandbox.namespace.clone());
     config.insert(KEY_WORKSPACE.to_string(), sandbox.workspace.clone());
-    // The supervisor installs its own seccomp BPF filter around the agent
-    // process and uses clone/unshare for namespace setup. security.nesting
-    // enables those paths.
-    config.insert("security.nesting".to_string(), "true".to_string());
-
     // template.environment takes precedence over spec.environment on key
     // collision, plus the two driver-injected vars the supervisor needs to
     // reach the gateway.
@@ -899,10 +894,9 @@ mod tests {
             !config.keys().any(|key| key.starts_with("raw.")),
             "{config:?}"
         );
-        assert_eq!(
-            config.get("security.nesting").map(String::as_str),
-            Some("true")
-        );
+        // The supervisor's namespaces, nftables fence and seccomp filter work
+        // in an unnested container; nesting is only set when asked for.
+        assert!(!config.contains_key("security.nesting"), "{config:?}");
         assert_eq!(
             config
                 .get("environment.OPENSHELL_SANDBOX_ID")
