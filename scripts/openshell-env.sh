@@ -205,8 +205,11 @@ stop_process() {
 
 start_driver() {
     rm -f "$DRIVER_SOCKET"
+    # The gateway here is plaintext, as upstream's own suites run it; the
+    # driver refuses one unless told this is a test environment.
     "$DRIVER_BIN" \
         --socket "$DRIVER_SOCKET" \
+        --allow-plaintext-gateway \
         --project "$PROJECT" \
         --log-level "info,openshell_driver_lxd=debug" \
         --supervisor-image "$SUPERVISOR_IMAGE" \

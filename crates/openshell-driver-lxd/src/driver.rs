@@ -266,6 +266,32 @@ impl LxdComputeDriver {
             self.config.default_max_processes,
         )?;
 
+        // Files the supervisor needs before it starts. The TLS materials are
+        // read now, before anything is created, so a missing or unreadable
+        // one fails the create without leaving an instance behind.
+        let mut guest_files = Vec::new();
+        if has_token {
+            guest_files.push((
+                mapping::GUEST_SANDBOX_TOKEN_PATH,
+                spec.sandbox_token.as_bytes().to_vec(),
+            ));
+        }
+        if let Some(tls) = self.config.guest_tls() {
+            for (guest_path, host_path) in [
+                (mapping::GUEST_TLS_CA_PATH, tls.ca),
+                (mapping::GUEST_TLS_CERT_PATH, tls.cert),
+                (mapping::GUEST_TLS_KEY_PATH, tls.key),
+            ] {
+                let content = tokio::fs::read(host_path).await.map_err(|e| {
+                    DriverError::FailedPrecondition(format!(
+                        "could not read the sandbox TLS material {}: {e}",
+                        host_path.display()
+                    ))
+                })?;
+                guest_files.push((guest_path, content));
+            }
+            mapping::insert_guest_tls_environment(&mut config);
+        }
         if self.config.sandbox_nesting {
             config.insert("security.nesting".to_string(), "true".to_string());
         }
@@ -378,9 +404,9 @@ impl LxdComputeDriver {
             self.image_cache.resolve_alias(&template.image).await?
         };
 
-        // Create the instance stopped so we can push the token file before the
-        // supervisor starts — avoids a race where the supervisor reads
-        // OPENSHELL_SANDBOX_TOKEN_FILE before it has been written.
+        // Create the instance stopped so we can push the token and TLS files
+        // before the supervisor starts — avoids a race where the supervisor
+        // reads them before they have been written.
         let op = self
             .lxd
             .create_instance(
@@ -395,13 +421,11 @@ impl LxdComputeDriver {
         self.wait_operation(&op.id).await?;
 
         let post_create = async {
-            if has_token {
+            for (guest_path, content) in &guest_files {
+                // Pushed readable by root only: the supervisor runs as root,
+                // the workload it starts does not.
                 self.lxd
-                    .push_file_into_instance(
-                        &sandbox.name,
-                        mapping::GUEST_SANDBOX_TOKEN_PATH,
-                        spec.sandbox_token.as_bytes(),
-                    )
+                    .push_file_into_instance(&sandbox.name, guest_path, content)
                     .await?;
             }
 
@@ -593,7 +617,10 @@ impl LxdComputeDriver {
         })?;
         let host_ip = cidr.split('/').next().unwrap_or(cidr);
         let port = self.config.gateway_grpc_port;
-        Ok(format!("http://{host_ip}:{port}"))
+        Ok(format!(
+            "{}://{host_ip}:{port}",
+            self.config.gateway_scheme()
+        ))
     }
 
     pub async fn stop_sandbox(&self, name: &str) -> Result<(), DriverError> {

@@ -506,6 +506,80 @@ async fn host_alias_follows_the_gateway_endpoint() {
     }
 }
 
+/// With TLS materials sandboxes get an https endpoint and the materials at
+/// the paths the supervisor reads, readable by root only.
+#[tokio::test]
+async fn guest_tls_materials_reach_the_instance() {
+    let tls_dir = tempfile::tempdir().expect("create TLS dir");
+    let files = [
+        (
+            "ca.crt",
+            "--guest-tls-ca",
+            "OPENSHELL_TLS_CA",
+            "/etc/openshell/tls/client/ca.crt",
+        ),
+        (
+            "tls.crt",
+            "--guest-tls-cert",
+            "OPENSHELL_TLS_CERT",
+            "/etc/openshell/tls/client/tls.crt",
+        ),
+        (
+            "tls.key",
+            "--guest-tls-key",
+            "OPENSHELL_TLS_KEY",
+            "/etc/openshell/tls/client/tls.key",
+        ),
+    ];
+    let mut extra_args = Vec::new();
+    for (file, flag, _, _) in files {
+        let path = tls_dir.path().join(file);
+        std::fs::write(&path, format!("test {file}")).expect("write TLS material");
+        extra_args.extend([flag.to_string(), path.display().to_string()]);
+    }
+    let driver = Driver::start_with(DriverOptions {
+        allow_plaintext_gateway: false,
+        extra_args,
+        ..Default::default()
+    })
+    .await;
+    let name = unique_name("tls");
+    let _cleanup = driver.cleanup(&[&name]);
+
+    driver
+        .create(sandbox(&name))
+        .await
+        .expect("create_sandbox should succeed");
+
+    let config = lxd()
+        .get_instance(&name)
+        .await
+        .expect("raw get_instance")
+        .config;
+    let expected_endpoint = format!("https://{}:17670", bridge_ipv4("lxdbr0").await);
+    assert_eq!(
+        config
+            .get("environment.OPENSHELL_ENDPOINT")
+            .map(String::as_str),
+        Some(expected_endpoint.as_str())
+    );
+    for (file, _, env, guest_path) in files {
+        assert_eq!(
+            config
+                .get(&format!("environment.{env}"))
+                .map(String::as_str),
+            Some(guest_path),
+            "{env}"
+        );
+        let (content, mode) = lxd()
+            .get_file_from_instance(&name, guest_path)
+            .await
+            .unwrap_or_else(|e| panic!("{guest_path} should exist in the sandbox: {e}"));
+        assert_eq!(content.as_ref(), format!("test {file}").as_bytes());
+        assert_eq!(mode, 0o400, "{guest_path}");
+    }
+}
+
 /// A rejected create must not leave anything behind in LXD.
 #[tokio::test]
 async fn invalid_creates_are_rejected_without_leftovers() {

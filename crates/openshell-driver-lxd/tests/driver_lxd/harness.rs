@@ -266,6 +266,9 @@ pub struct DriverOptions {
     pub image_cache_alias_prefix: String,
     pub image_work_dir: PathBuf,
     pub start_retries: u32,
+    /// Passes `--allow-plaintext-gateway`. The stand-in supervisor never
+    /// connects to a gateway, so most tests need no TLS materials.
+    pub allow_plaintext_gateway: bool,
     pub extra_args: Vec<String>,
 }
 
@@ -278,6 +281,7 @@ impl Default for DriverOptions {
             image_cache_alias_prefix: DEFAULT_IMAGE_CACHE_ALIAS_PREFIX.to_string(),
             image_work_dir: image_work_dir(),
             start_retries: 1,
+            allow_plaintext_gateway: true,
             extra_args: Vec::new(),
         }
     }
@@ -375,6 +379,9 @@ impl Driver {
             Some(image) => {
                 cmd.args(["--supervisor-image", image]);
             }
+        }
+        if options.allow_plaintext_gateway {
+            cmd.arg("--allow-plaintext-gateway");
         }
         cmd.args(&options.extra_args)
             .stdin(Stdio::null())

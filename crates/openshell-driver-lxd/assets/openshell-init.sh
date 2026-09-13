@@ -176,11 +176,22 @@ fi
 # ---------------------------------------------------------------------------
 # 8. Probe OPENSHELL_ENDPOINT reachability before handing off to supervisor.
 # ---------------------------------------------------------------------------
+# An https gateway asks for the client certificate the supervisor presents, so
+# the probe presents it too.
+probe_endpoint() {
+    if [ -n "${OPENSHELL_TLS_CA:-}" ]; then
+        curl --silent --max-time 5 --output /dev/null --write-out "%{http_code}" \
+            --cacert "${OPENSHELL_TLS_CA}" --cert "${OPENSHELL_TLS_CERT:-}" \
+            --key "${OPENSHELL_TLS_KEY:-}" "${OPENSHELL_ENDPOINT}" 2>/dev/null
+    else
+        curl --silent --max-time 5 --output /dev/null --write-out "%{http_code}" \
+            "${OPENSHELL_ENDPOINT}" 2>/dev/null
+    fi
+}
+
 if [ -n "${OPENSHELL_ENDPOINT:-}" ] && command -v curl >/dev/null 2>&1; then
     _probe_result="unreachable"
-    if curl --silent --max-time 5 --output /dev/null \
-            --write-out "%{http_code}" "${OPENSHELL_ENDPOINT}" 2>/dev/null \
-            | grep -qE '^[1-9][0-9]{2}$'; then
+    if probe_endpoint | grep -qE '^[1-9][0-9]{2}$'; then
         _probe_result="reachable"
     elif [ -n "$OPENSHELL_HOST_IP" ] && \
          curl --silent --max-time 5 --output /dev/null \

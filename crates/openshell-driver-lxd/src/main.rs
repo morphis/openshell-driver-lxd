@@ -26,6 +26,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // Refuse a configuration that would hand sandboxes a plaintext gateway
+    // nobody asked for, before binding the socket the gateway connects to.
+    if let Err(e) = config.validate() {
+        error!("{e}");
+        std::process::exit(2);
+    }
+    if let Some(tls) = config.guest_tls() {
+        for path in [tls.ca, tls.cert, tls.key] {
+            if let Err(e) = fs::File::open(path) {
+                error!(path = %path.display(), %e, "cannot read sandbox TLS material");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        warn!("sandboxes reach the gateway over plaintext HTTP (--allow-plaintext-gateway)");
+    }
+
     if let Some(parent) = config.socket.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;

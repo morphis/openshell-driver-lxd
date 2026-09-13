@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
@@ -227,10 +227,89 @@ pub struct Config {
     #[arg(long)]
     pub sandbox_nesting: bool,
 
+    /// PEM CA certificate sandboxes verify the gateway's certificate against.
+    /// Copied into every sandbox, with --guest-tls-cert and --guest-tls-key,
+    /// for the supervisor's mutual-TLS connection to the gateway; the
+    /// gateway endpoint is then `https`. Read on every create, so rotated
+    /// files reach new sandboxes.
+    #[arg(long, requires_all = ["guest_tls_cert", "guest_tls_key"])]
+    pub guest_tls_ca: Option<PathBuf>,
+
+    /// PEM client certificate sandboxes present to the gateway.
+    #[arg(long, requires_all = ["guest_tls_ca", "guest_tls_key"])]
+    pub guest_tls_cert: Option<PathBuf>,
+
+    /// PEM private key of --guest-tls-cert.
+    #[arg(long, requires_all = ["guest_tls_ca", "guest_tls_cert"])]
+    pub guest_tls_key: Option<PathBuf>,
+
+    /// Let sandboxes reach the gateway over plaintext HTTP instead of TLS.
+    /// Sandbox tokens, policy and credentials then cross the network
+    /// unencrypted, so this is only for local testing.
+    #[arg(long, conflicts_with_all = ["guest_tls_ca", "guest_tls_cert", "guest_tls_key"])]
+    pub allow_plaintext_gateway: bool,
+
     /// Deadline, in seconds, to wait for an LXD operation to complete before
     /// failing the RPC with DeadlineExceeded.
     #[arg(long, default_value_t = DEFAULT_OPERATION_TIMEOUT_SECS)]
     pub operation_timeout_secs: u64,
+}
+
+/// Host paths of the TLS materials sandboxes connect to the gateway with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestTls<'a> {
+    pub ca: &'a Path,
+    pub cert: &'a Path,
+    pub key: &'a Path,
+}
+
+impl Config {
+    /// The TLS materials for sandboxes, when configured.
+    #[must_use]
+    pub fn guest_tls(&self) -> Option<GuestTls<'_>> {
+        Some(GuestTls {
+            ca: self.guest_tls_ca.as_deref()?,
+            cert: self.guest_tls_cert.as_deref()?,
+            key: self.guest_tls_key.as_deref()?,
+        })
+    }
+
+    /// Scheme of the gateway endpoint the driver derives from a network.
+    #[must_use]
+    pub fn gateway_scheme(&self) -> &'static str {
+        if self.guest_tls().is_some() {
+            "https"
+        } else {
+            "http"
+        }
+    }
+
+    /// Checks that sandboxes will reach the gateway over TLS, or that
+    /// plaintext was explicitly allowed, and that `--gateway-endpoint`
+    /// agrees. clap enforces the rest (all three TLS files or none, and not
+    /// alongside `--allow-plaintext-gateway`).
+    pub fn validate(&self) -> Result<(), String> {
+        let tls = self.guest_tls().is_some();
+        if !tls && !self.allow_plaintext_gateway {
+            return Err(
+                "sandboxes connect to the gateway over TLS: set --guest-tls-ca, \
+                 --guest-tls-cert and --guest-tls-key (--allow-plaintext-gateway permits a \
+                 plaintext gateway for local testing)"
+                    .to_string(),
+            );
+        }
+        match self.gateway_endpoint.as_deref() {
+            Some(endpoint) if tls && !endpoint.starts_with("https://") => Err(format!(
+                "--gateway-endpoint {endpoint} is not https, but sandboxes are given TLS \
+                 materials; use an https:// endpoint"
+            )),
+            Some(endpoint) if !tls && !endpoint.starts_with("http://") => Err(format!(
+                "--gateway-endpoint {endpoint} is https, which needs --guest-tls-ca, \
+                 --guest-tls-cert and --guest-tls-key"
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Validates `--gateway-endpoint`: an `http` or `https` URL naming a host and
@@ -369,6 +448,79 @@ mod tests {
                 "{value} should be rejected"
             );
         }
+    }
+
+    const TLS_ARGS: [&str; 6] = [
+        "--guest-tls-ca",
+        "/etc/openshell/tls/ca.crt",
+        "--guest-tls-cert",
+        "/etc/openshell/tls/client/tls.crt",
+        "--guest-tls-key",
+        "/etc/openshell/tls/client/tls.key",
+    ];
+
+    fn parse(args: &[&str]) -> Result<Config, clap::Error> {
+        Config::try_parse_from(std::iter::once("openshell-driver-lxd").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn tls_to_the_gateway_is_required_unless_plaintext_is_allowed() {
+        let neither = parse(&[]).unwrap();
+        assert!(neither.validate().is_err());
+
+        let tls = parse(&TLS_ARGS).unwrap();
+        assert_eq!(tls.validate(), Ok(()));
+        assert_eq!(tls.gateway_scheme(), "https");
+        assert_eq!(
+            tls.guest_tls(),
+            Some(GuestTls {
+                ca: Path::new("/etc/openshell/tls/ca.crt"),
+                cert: Path::new("/etc/openshell/tls/client/tls.crt"),
+                key: Path::new("/etc/openshell/tls/client/tls.key"),
+            })
+        );
+
+        let plaintext = parse(&["--allow-plaintext-gateway"]).unwrap();
+        assert_eq!(plaintext.validate(), Ok(()));
+        assert_eq!(plaintext.gateway_scheme(), "http");
+        assert_eq!(plaintext.guest_tls(), None);
+    }
+
+    #[test]
+    fn tls_materials_come_together_and_not_with_plaintext() {
+        assert!(parse(&TLS_ARGS[..4]).is_err());
+        assert!(parse(&["--guest-tls-key", "/k"]).is_err());
+
+        let mut both = TLS_ARGS.to_vec();
+        both.push("--allow-plaintext-gateway");
+        assert!(parse(&both).is_err());
+    }
+
+    #[test]
+    fn gateway_endpoint_scheme_matches_the_transport() {
+        let mut tls_https = TLS_ARGS.to_vec();
+        tls_https.extend(["--gateway-endpoint", "https://10.0.0.5:17670"]);
+        assert_eq!(parse(&tls_https).unwrap().validate(), Ok(()));
+
+        let mut tls_http = TLS_ARGS.to_vec();
+        tls_http.extend(["--gateway-endpoint", "http://10.0.0.5:17670"]);
+        assert!(parse(&tls_http).unwrap().validate().is_err());
+
+        let plaintext_https = parse(&[
+            "--allow-plaintext-gateway",
+            "--gateway-endpoint",
+            "https://10.0.0.5:17670",
+        ])
+        .unwrap();
+        assert!(plaintext_https.validate().is_err());
+
+        let plaintext_http = parse(&[
+            "--allow-plaintext-gateway",
+            "--gateway-endpoint",
+            "http://10.0.0.5:17670",
+        ])
+        .unwrap();
+        assert_eq!(plaintext_http.validate(), Ok(()));
     }
 
     #[test]

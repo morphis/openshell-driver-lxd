@@ -49,14 +49,35 @@ gateway so you can create a sandbox end-to-end.
    lxd init --auto
    ```
 
-2. **Build and run the driver:**
+2. **Create the gateway's PKI.** Sandboxes connect to the gateway over
+   mutual TLS, and the driver refuses to start without the materials to give
+   them. The gateway release generates a CA, server and client certificates
+   and the sandbox-token signing key; the server certificate must name the
+   address sandboxes reach the gateway at:
+
+   ```sh
+   BRIDGE_IP="$(lxc network get lxdbr0 ipv4.address | cut -d/ -f1)"
+   PKI=/tmp/openshell-pki
+   openshell-gateway generate-certs --output-dir "$PKI" --server-san "$BRIDGE_IP"
+   ```
+
+3. **Build and run the driver:**
 
    ```sh
    make build
    ./target/debug/openshell-driver-lxd \
        --socket /tmp/openshell-driver.sock \
-       --gateway-grpc-port 17670
+       --gateway-grpc-port 17670 \
+       --guest-tls-ca "$PKI/ca.crt" \
+       --guest-tls-cert "$PKI/client/tls.crt" \
+       --guest-tls-key "$PKI/client/tls.key"
    ```
+
+   The CA, client certificate and key are copied into every sandbox for its
+   supervisor, and sandboxes are pointed at `https://<bridge address>:17670`.
+   `--allow-plaintext-gateway` replaces the three TLS flags with a plaintext
+   gateway, for local testing only; the repository's test environment uses
+   it.
 
    No sandbox image needs to be pre-built or pre-loaded: the driver pulls the
    default image (`--default-image`, the upstream community
@@ -81,37 +102,32 @@ gateway so you can create a sandbox end-to-end.
 
    `--gateway-grpc-port` must match the port the gateway is told to listen on
    below — the driver uses it to construct each sandbox's `OPENSHELL_ENDPOINT`.
+   A gateway that is not on the bridge needs `--gateway-endpoint` instead (see
+   [Reaching the gateway](#reaching-the-gateway)).
 
-3. **Start an OpenShell gateway pointed at the driver's socket**, using the
+4. **Start an OpenShell gateway pointed at the driver's socket**, using the
    out-of-tree driver flags. The gateway must be able to mint sandbox tokens
    (`gateway_jwt`), or every supervisor exits with "no sandbox token source
-   available". A plaintext gateway still enforces request authentication by
-   default, so for local/dev use the config also disables it. This is the
-   setup the upstream test suites run against OpenShell v0.0.116 (config
-   schema `version = 1` and `--drivers`; later gateways use `version = 2`
-   and `--compute-driver`):
+   available". This is for OpenShell v0.0.116 (config schema `version = 1`
+   and `--drivers`; later gateways use `version = 2` and
+   `--compute-driver`):
 
    ```sh
-   openssl genpkey -algorithm ed25519 -out /tmp/openshell-jwt.pem
-   openssl pkey -in /tmp/openshell-jwt.pem -pubout -out /tmp/openshell-jwt.pub
-   echo lxd-demo > /tmp/openshell-jwt.kid
-
-   cat > /tmp/openshell-gateway.toml <<'EOF'
+   cat > /tmp/openshell-gateway.toml <<EOF
    [openshell]
    version = 1
 
-   [openshell.gateway.auth]
-   allow_unauthenticated_users = true
-
    [openshell.gateway.gateway_jwt]
-   signing_key_path = "/tmp/openshell-jwt.pem"
-   public_key_path = "/tmp/openshell-jwt.pub"
-   kid_path = "/tmp/openshell-jwt.kid"
+   signing_key_path = "$PKI/jwt/signing.pem"
+   public_key_path = "$PKI/jwt/public.pem"
+   kid_path = "$PKI/jwt/kid"
    EOF
 
-   BRIDGE_IP="$(lxc network get lxdbr0 ipv4.address | cut -d/ -f1)"
    openshell-gateway \
-       --disable-tls \
+       --tls-cert "$PKI/server/tls.crt" \
+       --tls-key "$PKI/server/tls.key" \
+       --tls-client-ca "$PKI/ca.crt" \
+       --enable-mtls-auth true \
        --bind-address "$BRIDGE_IP" \
        --port 17670 \
        --drivers lxd \
@@ -122,20 +138,21 @@ gateway so you can create a sandbox end-to-end.
 
    The gateway binds to the `lxdbr0` bridge address: the default loopback-only
    bind is unreachable from sandboxes, and the driver points each sandbox's
-   `OPENSHELL_ENDPOINT` at that address. `--disable-tls` plus
-   `allow_unauthenticated_users` are a plaintext, unauthenticated dev
-   shortcut — **not** for production use; see
-   [Security limitations](#security-limitations).
+   `OPENSHELL_ENDPOINT` at that address. With a client CA the gateway requires
+   a client certificate on every connection, from the CLI and from sandboxes
+   alike.
 
    Run the supervisor released with the gateway: pass
    `--supervisor-image ghcr.io/nvidia/openshell/supervisor:<gateway version>`
    to the driver. A supervisor from a different release than the gateway can
    fail to sync policy and exit.
 
-4. **Register the gateway with the CLI and create a sandbox:**
+5. **Register the gateway with the CLI and create a sandbox.** The CLI
+   imports the client certificate from `OPENSHELL_LOCAL_TLS_DIR`:
 
    ```sh
-   openshell gateway add "http://$BRIDGE_IP:17670" --local --name lxd-demo
+   OPENSHELL_LOCAL_TLS_DIR="$PKI" \
+       openshell gateway add "https://$BRIDGE_IP:17670" --local --name lxd-demo
    openshell gateway select lxd-demo
 
    openshell sandbox create --name demo -- id
@@ -145,6 +162,13 @@ gateway so you can create a sandbox end-to-end.
 
 ## Security limitations
 
+- **Every sandbox holds the same gateway client certificate.** As with
+  upstream's Docker driver, the certificate and key passed with
+  `--guest-tls-cert`/`--guest-tls-key` are copied into each sandbox (mode
+  `0400`, owned by root, for the supervisor). The gateway identifies a
+  sandbox by its sandbox token, not its certificate, and a gateway with
+  mTLS authentication accepts that certificate as a client, so root inside a
+  sandbox holds a credential the gateway trusts.
 - **No default-deny egress or sandbox-to-sandbox network isolation.**
   Sandboxes can reach each other and the network freely today. `lxd-client`
   has the Network ACL APIs needed to build this, but nothing in the driver

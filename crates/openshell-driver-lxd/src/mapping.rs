@@ -56,6 +56,26 @@ pub fn main_process_spec(spec: &DriverSandboxSpec) -> String {
     .to_string()
 }
 
+/// Guest-side paths of the TLS materials the supervisor connects to the
+/// gateway with — the paths upstream's `openshell-core::driver_utils` gives
+/// every driver (OpenShell v0.0.116), so the layout matches the in-tree ones.
+pub(crate) const GUEST_TLS_CA_PATH: &str = "/etc/openshell/tls/client/ca.crt";
+pub(crate) const GUEST_TLS_CERT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
+pub(crate) const GUEST_TLS_KEY_PATH: &str = "/etc/openshell/tls/client/tls.key";
+
+/// Points the supervisor at the TLS materials pushed to [`GUEST_TLS_CA_PATH`],
+/// [`GUEST_TLS_CERT_PATH`] and [`GUEST_TLS_KEY_PATH`] (upstream's
+/// `OPENSHELL_TLS_CA`, `OPENSHELL_TLS_CERT` and `OPENSHELL_TLS_KEY`).
+pub fn insert_guest_tls_environment(config: &mut HashMap<String, String>) {
+    for (name, path) in [
+        ("OPENSHELL_TLS_CA", GUEST_TLS_CA_PATH),
+        ("OPENSHELL_TLS_CERT", GUEST_TLS_CERT_PATH),
+        ("OPENSHELL_TLS_KEY", GUEST_TLS_KEY_PATH),
+    ] {
+        config.insert(format!("{ENV_PREFIX}{name}"), path.to_string());
+    }
+}
+
 /// Guest-side directory where the digest-keyed supervisor storage volume is mounted.
 pub(crate) const GUEST_SUPERVISOR_BIN_DIR: &str = "/opt/openshell/bin";
 
@@ -1328,6 +1348,29 @@ mod tests {
                 config.get("limits.processes").map(String::as_str),
                 Some("4096")
             );
+        }
+    }
+
+    #[test]
+    fn guest_tls_environment_names_the_pushed_files() {
+        let mut config = HashMap::new();
+        insert_guest_tls_environment(&mut config);
+
+        for (key, value) in [
+            (
+                "environment.OPENSHELL_TLS_CA",
+                "/etc/openshell/tls/client/ca.crt",
+            ),
+            (
+                "environment.OPENSHELL_TLS_CERT",
+                "/etc/openshell/tls/client/tls.crt",
+            ),
+            (
+                "environment.OPENSHELL_TLS_KEY",
+                "/etc/openshell/tls/client/tls.key",
+            ),
+        ] {
+            assert_eq!(config.get(key).map(String::as_str), Some(value), "{key}");
         }
     }
 
