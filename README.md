@@ -208,11 +208,18 @@ gateway request (e.g. `docker://registry.example.com/org/sandbox:latest` or
   the OCI reference and resolves the manifest digest for the host architecture
   by reading the raw image index and selecting the matching `os`/`architecture`
   entry, so two architectures of the same tag never share a cache entry. It maps
-  the digest to a local LXD image alias (e.g. `openshell-oci-r2-<64-hex-sha256>`, where `r2` is the conversion revision: a driver that converts images differently imports them again instead of reusing old conversions).
+  the digest to a local LXD image alias (e.g. `openshell-oci-r3-<64-hex-sha256>`, where `r3` is the conversion revision: a driver that converts images differently imports them again instead of reusing old conversions).
   If the alias is already present in LXD, it is reused immediately.
   If not cached, the driver pulls the image by digest using `skopeo`, unpacks it with
   `umoci`, packs it into squashfs and metadata archives, and imports it via LXD's
   split image REST API.
+- **Init:** Conversion adds the driver's init script as `/openshell-init.sh`
+  and points `/sbin/init` at it, replacing any init the image ships. LXD
+  starts `/sbin/init` in a container, and the script sets up networking and
+  hands over to the supervisor. The driver sets no `raw.*` keys, so sandboxes
+  can run in a restricted project; one needs
+  `restricted.containers.nesting=allow`, as sandboxes set `security.nesting`
+  (see [Security limitations](#security-limitations)).
 - **Tag mutation:** Because the cache is keyed on content digest rather than tag,
   if a tag points to a new digest, the driver will automatically pull and import the new
   image on first use.

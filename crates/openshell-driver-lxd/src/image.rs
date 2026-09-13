@@ -22,6 +22,17 @@ pub const DEFAULT_CACHE_ALIAS_PREFIX: &str = "openshell-oci-";
 /// Canonical path inside the guest rootfs for the injected PID 1 init script.
 pub(crate) const GUEST_INIT_SCRIPT_PATH: &str = "/openshell-init.sh";
 
+/// The init LXD starts in a container. LXD has no instance option for a
+/// container's init; the only other way to change it is `lxc.init.cmd` in
+/// `raw.lxc`, a low-level key restricted projects refuse. Pointing this path
+/// at [`GUEST_INIT_SCRIPT_PATH`] in the converted image lets a sandbox boot in
+/// a restricted project.
+pub(crate) const GUEST_INIT_PATH: &str = "/sbin/init";
+
+/// How many symlinks resolving a path inside a rootfs may follow, as the
+/// kernel's limit for a path lookup.
+const MAX_SYMLINK_HOPS: usize = 40;
+
 /// Bundled POSIX/busybox init script injected into converted rootfs images.
 const INIT_SCRIPT_CONTENTS: &str = include_str!("../assets/openshell-init.sh");
 
@@ -67,8 +78,9 @@ pub fn validate_reference(reference: &str) -> Result<(), DriverError> {
 ///
 /// Bump it whenever the conversion produces a different image for the same
 /// OCI digest, so images converted the old way are imported again instead of
-/// being reused. Revision 2 keeps the image's file ownership.
-pub const CONVERSION_REVISION: u32 = 2;
+/// being reused. Revision 2 keeps the image's file ownership; revision 3 boots
+/// the init script through `/sbin/init`.
+pub const CONVERSION_REVISION: u32 = 3;
 
 /// Returns the deterministic LXD cache alias for the given content digest.
 ///
@@ -788,8 +800,10 @@ impl OciImporter for SkopeoImporter {
             tracing::debug!(path = %oci_dest.display(), %e, "could not free OCI copy early");
         }
 
-        // Inject the minimal init script before repacking with mksquashfs.
+        // Inject the minimal init script before repacking with mksquashfs, and
+        // make it the container's init.
         inject_init_script(&rootfs_dest)?;
+        install_init(&rootfs_dest)?;
 
         // Restore the owners the image specifies, which the rootless unpack
         // only recorded in xattrs.
@@ -1203,6 +1217,96 @@ fn inject_init_script(rootfs_dest: &Path) -> Result<(), DriverError> {
         })
 }
 
+/// Resolves `guest_path`, an absolute path as the container sees it, to the
+/// host path it names under `rootfs`, following symlinks in its directories
+/// the way the container would.
+///
+/// The rootfs comes from an arbitrary image, so its symlinks must never be
+/// followed on the host: `sbin -> /usr/sbin` would otherwise lead the driver
+/// to the host's own `/usr/sbin`. Absolute targets are taken relative to
+/// `rootfs` and `..` stops at it. The last component is not followed.
+fn resolve_in_rootfs(rootfs: &Path, guest_path: &str) -> Result<PathBuf, DriverError> {
+    use std::collections::VecDeque;
+    use std::path::Component;
+
+    let guest = Path::new(guest_path);
+    let file_name = guest
+        .file_name()
+        .ok_or_else(|| DriverError::ImageImport(format!("{guest_path:?} does not name a file")))?;
+    let mut pending: VecDeque<_> = guest
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .map(|c| c.as_os_str().to_owned())
+        .collect();
+
+    let mut resolved = PathBuf::new();
+    let mut hops = 0;
+    while let Some(part) = pending.pop_front() {
+        match Path::new(&part).components().next() {
+            Some(Component::Normal(name)) => {
+                let candidate = rootfs.join(&resolved).join(name);
+                let is_symlink = std::fs::symlink_metadata(&candidate)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink());
+                if !is_symlink {
+                    resolved.push(name);
+                    continue;
+                }
+                hops += 1;
+                if hops > MAX_SYMLINK_HOPS {
+                    return Err(DriverError::ImageImport(format!(
+                        "too many symlinks resolving {guest_path:?} in the image"
+                    )));
+                }
+                let target = std::fs::read_link(&candidate).map_err(|e| {
+                    DriverError::ImageImport(format!(
+                        "failed to read symlink {}: {e}",
+                        candidate.display()
+                    ))
+                })?;
+                if target.is_absolute() {
+                    resolved.clear();
+                }
+                for component in target.components().rev() {
+                    pending.push_front(component.as_os_str().to_owned());
+                }
+            }
+            Some(Component::ParentDir) => {
+                resolved.pop();
+            }
+            // The root and `.` leave the position unchanged.
+            _ => {}
+        }
+    }
+
+    Ok(rootfs.join(resolved).join(file_name))
+}
+
+/// Makes [`GUEST_INIT_PATH`] a symlink to the injected init script, replacing
+/// whatever init the image shipped: a sandbox's init is always the script,
+/// which hands over to the supervisor.
+fn install_init(rootfs_dest: &Path) -> Result<(), DriverError> {
+    let init = resolve_in_rootfs(rootfs_dest, GUEST_INIT_PATH)?;
+    let io_err = |what: &str, e: std::io::Error| {
+        DriverError::ImageImport(format!("failed to {what} {}: {e}", init.display()))
+    };
+
+    if let Some(parent) = init.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| io_err("create the parent of", e))?;
+    }
+    match std::fs::symlink_metadata(&init) {
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(DriverError::ImageImport(format!(
+                "the image has a directory at {GUEST_INIT_PATH}"
+            )));
+        }
+        Ok(_) => std::fs::remove_file(&init).map_err(|e| io_err("remove", e))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_err("stat", e)),
+    }
+    std::os::unix::fs::symlink(GUEST_INIT_SCRIPT_PATH, &init).map_err(|e| io_err("create", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1212,8 +1316,8 @@ mod tests {
         let digest_body = "ab".repeat(32);
         let digest = format!("sha256:{digest_body}");
         let alias = cache_alias(&digest);
-        assert_eq!(alias, format!("openshell-oci-r2-{digest_body}"));
-        assert_eq!(alias.len(), "openshell-oci-r2-".len() + 64);
+        assert_eq!(alias, format!("openshell-oci-r3-{digest_body}"));
+        assert_eq!(alias.len(), "openshell-oci-r3-".len() + 64);
     }
 
     /// Values observed from `umoci unpack --rootless` (umoci 0.4.7).
@@ -1576,7 +1680,7 @@ mod tests {
 
         // 1. Initial resolution is a miss -> calls importer.import once
         let res_alias = cache.resolve_alias("ubuntu:22.04").await.unwrap();
-        let expected_alias = format!("test-oci-r2-{digest_hex}");
+        let expected_alias = format!("test-oci-r3-{digest_hex}");
         assert_eq!(res_alias, expected_alias);
         assert_eq!(
             importer
@@ -1756,6 +1860,94 @@ mod tests {
             std::fs::read_to_string(&script).unwrap(),
             INIT_SCRIPT_CONTENTS
         );
+    }
+
+    #[test]
+    fn init_is_the_init_script() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let rootfs = temp_dir.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("sbin")).unwrap();
+        std::fs::write(rootfs.join("sbin/init"), "#!/bin/sh\nexec systemd\n").unwrap();
+
+        install_init(&rootfs).unwrap();
+
+        let init = rootfs.join("sbin/init");
+        assert!(std::fs::symlink_metadata(&init)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(&init).unwrap(),
+            PathBuf::from(GUEST_INIT_SCRIPT_PATH)
+        );
+    }
+
+    #[test]
+    fn init_is_installed_where_the_image_has_no_sbin() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let rootfs = temp_dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        install_init(&rootfs).unwrap();
+
+        assert_eq!(
+            std::fs::read_link(rootfs.join("sbin/init")).unwrap(),
+            PathBuf::from(GUEST_INIT_SCRIPT_PATH)
+        );
+    }
+
+    /// A merged-/usr image links `sbin` to `usr/sbin`; the init goes where
+    /// the container will look for it.
+    #[test]
+    fn init_follows_a_relative_sbin_symlink_inside_the_rootfs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let rootfs = temp_dir.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("usr/sbin")).unwrap();
+        std::os::unix::fs::symlink("usr/sbin", rootfs.join("sbin")).unwrap();
+
+        install_init(&rootfs).unwrap();
+
+        assert_eq!(
+            std::fs::read_link(rootfs.join("usr/sbin/init")).unwrap(),
+            PathBuf::from(GUEST_INIT_SCRIPT_PATH)
+        );
+    }
+
+    /// An absolute symlink in the image points inside the container, never at
+    /// the host: `sbin -> /usr/sbin` must not reach the host's `/usr/sbin`.
+    #[test]
+    fn init_resolves_absolute_symlinks_against_the_rootfs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let rootfs = temp_dir.path().join("rootfs");
+        let host = temp_dir.path().join("host-usr-sbin");
+        std::fs::create_dir_all(rootfs.join("usr/sbin")).unwrap();
+        std::fs::create_dir_all(&host).unwrap();
+        std::os::unix::fs::symlink("/usr/sbin", rootfs.join("sbin")).unwrap();
+        // Would resolve out of the rootfs if `..` were not stopped at its root.
+        std::os::unix::fs::symlink("../../../host-usr-sbin", rootfs.join("usr/escape")).unwrap();
+
+        assert_eq!(
+            resolve_in_rootfs(&rootfs, "/sbin/init").unwrap(),
+            rootfs.join("usr/sbin/init")
+        );
+        assert_eq!(
+            resolve_in_rootfs(&rootfs, "/usr/escape/init").unwrap(),
+            rootfs.join("host-usr-sbin/init")
+        );
+
+        install_init(&rootfs).unwrap();
+        assert!(rootfs.join("usr/sbin/init").symlink_metadata().is_ok());
+        assert_eq!(std::fs::read_dir(&host).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn symlink_loops_in_the_image_are_an_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let rootfs = temp_dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::os::unix::fs::symlink("/sbin", rootfs.join("sbin")).unwrap();
+
+        assert!(install_init(&rootfs).is_err());
     }
 
     #[tokio::test]

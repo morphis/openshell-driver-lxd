@@ -78,17 +78,6 @@ pub(crate) fn dhcp_client_volume_name(digest: &str) -> String {
     format!("openshell-dhcp-client-{clean}")
 }
 
-/// LXD system containers ignore OCI entrypoints and run their own init. To ensure
-/// network interfaces (lo, eth0) are brought up and an IPv4 lease is obtained
-/// via DHCP before the supervisor starts, `lxc.init.cmd` is pointed at the
-/// injected init script (`/openshell-init.sh`) which performs one-shot network
-/// initialization and then exec-replaces itself into `/opt/openshell/bin/openshell-sandbox`
-/// (mounted from a custom storage volume disk device).
-/// Publishing an instance to an image does *not* carry this kind of instance config
-/// forward, so it has to be set on every create, not just once on the image.
-const KEY_RAW_LXC: &str = "raw.lxc";
-pub(crate) const RAW_LXC_INIT_CMD: &str = "lxc.init.cmd = /openshell-init.sh";
-
 /// Maps an [`Instance`] to a [`DriverSandbox`] observation. `spec` is left
 /// unset, per the proto's own doc comment: "Drivers may omit this in observed
 /// snapshots returned by Get/List/Watch."
@@ -271,7 +260,6 @@ pub fn build_create_config(
     config.insert(KEY_SANDBOX_ID.to_string(), sandbox.id.clone());
     config.insert(KEY_NAMESPACE.to_string(), sandbox.namespace.clone());
     config.insert(KEY_WORKSPACE.to_string(), sandbox.workspace.clone());
-    config.insert(KEY_RAW_LXC.to_string(), RAW_LXC_INIT_CMD.to_string());
     // The supervisor installs its own seccomp BPF filter around the agent
     // process and uses clone/unshare for namespace setup. security.nesting
     // enables those paths.
@@ -579,8 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn guest_supervisor_paths_and_init_cmd_contract() {
-        assert_eq!(RAW_LXC_INIT_CMD, "lxc.init.cmd = /openshell-init.sh");
+    fn guest_supervisor_paths_contract() {
         assert_eq!(GUEST_SUPERVISOR_BIN_DIR, "/opt/openshell/bin");
         assert_eq!(
             GUEST_SUPERVISOR_BIN_PATH,
@@ -906,9 +893,11 @@ mod tests {
         );
         assert_eq!(config.get(KEY_NAMESPACE).map(String::as_str), Some("ns"));
         assert_eq!(config.get(KEY_WORKSPACE).map(String::as_str), Some("ws"));
-        assert_eq!(
-            config.get("raw.lxc").map(String::as_str),
-            Some(RAW_LXC_INIT_CMD)
+        // The image boots the init script as /sbin/init; low-level keys
+        // would make restricted projects refuse the sandbox.
+        assert!(
+            !config.keys().any(|key| key.starts_with("raw.")),
+            "{config:?}"
         );
         assert_eq!(
             config.get("security.nesting").map(String::as_str),
