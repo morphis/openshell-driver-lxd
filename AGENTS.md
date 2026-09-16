@@ -20,6 +20,8 @@ script.
 | `make fmt` / `make fmt-check` | format / check formatting |
 | `make clippy` | `cargo clippy --workspace --all-targets -- -D warnings` |
 | `make proto` | rebuild `computev1` (forces proto codegen) |
+| `make rock` | pack the OCI rock with Rockcraft |
+| `make test-rock` | run smoke tests against the packed rock |
 | `make run` | run the driver binary |
 | `make release` | `cargo build --release --workspace` |
 | `make clean` | `cargo clean` |
@@ -47,3 +49,11 @@ When making changes to snap packaging:
 - The `lxd` interface auto-connects when the snap is installed
   alongside the LXD snap; manual connection is required for `--dangerous`
   installs (see README).
+
+## Rock packaging
+
+The rock definition lives in `rockcraft.yaml` (base `ubuntu@26.04`). It bundles
+`openshell-gateway` (upstream NVIDIA/OpenShell) and `openshell-driver-lxd`
+under Pebble. A GitHub Actions workflow (`.github/workflows/rock.yaml`) builds
+and smoke-tests the rock (`tests/rock/smoke.sh`) on every push/PR to `main`, and
+assembles/pushes multi-arch OCI images and manifests to GHCR on push to `main`.

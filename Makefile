@@ -1,4 +1,4 @@
-.PHONY: build release check test test-lxd-client test-driver test-conformance test-upstream-e2e setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean
+.PHONY: build release check test test-lxd-client test-driver test-conformance test-upstream-e2e test-rock rock setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean
 
 build:
 	cargo build --workspace
@@ -57,9 +57,17 @@ fmt-check:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 
-# Lints the shell scripts under scripts/.
+# Lints the shell scripts under scripts/ and tests/.
 shellcheck:
-	shellcheck scripts/*.sh
+	shellcheck scripts/*.sh tests/rock/*.sh
+
+# Packs the openshell-gateway OCI rock with rockcraft.
+rock:
+	rockcraft pack
+
+# Runs smoke tests against the packed rock.
+test-rock:
+	./tests/rock/smoke.sh
 
 # Builds the API docs, treating warnings (e.g. broken intra-doc links) as
 # errors so documentation stays valid.
