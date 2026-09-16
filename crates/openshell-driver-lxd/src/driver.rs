@@ -137,7 +137,7 @@ impl LxdComputeDriver {
     }
 
     /// Removes images, volumes and host files the driver no longer uses (see
-    /// [`crate::gc`]). Best-effort: failures are logged and retried on the
+    /// `crate::gc`). Best-effort: failures are logged and retried on the
     /// next run.
     pub async fn collect_garbage(&self) {
         // Without the current supervisor digest nothing supervisor-related

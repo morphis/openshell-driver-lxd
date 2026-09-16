@@ -17,6 +17,15 @@ fn help_lists_socket_flag() {
         stdout.contains("--dhcp-client-bin"),
         "stdout was:\n{stdout}"
     );
+    assert!(stdout.contains("--lxd-url"), "stdout was:\n{stdout}");
+    assert!(
+        stdout.contains("--gateway-endpoint"),
+        "stdout was:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("--lxd-server-fingerprint"),
+        "stdout was:\n{stdout}"
+    );
 }
 
 /// Without TLS materials or an explicit opt-out the driver refuses to start,

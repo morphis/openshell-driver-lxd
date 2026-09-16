@@ -214,15 +214,21 @@ pub struct Config {
 
     /// PEM CA certificate to verify the remote LXD server cert.
     /// Omit to use the built-in webpki CA bundle.
-    #[arg(long, requires = "lxd_url", conflicts_with = "lxd_server_cert")]
+    #[arg(long, requires = "lxd_url", conflicts_with_all = ["lxd_server_cert", "lxd_server_fingerprint"])]
     pub lxd_server_ca: Option<PathBuf>,
 
     /// PEM certificate the remote LXD presents, trusted exactly whatever
     /// names it carries, as `lxc remote add` does. LXD's own certificate
     /// names only its hostname and loopback, so use this to reach LXD by IP
     /// address (on a cluster member, the file is `cluster.crt`).
-    #[arg(long, requires = "lxd_url")]
+    #[arg(long, requires = "lxd_url", conflicts_with_all = ["lxd_server_ca", "lxd_server_fingerprint"])]
     pub lxd_server_cert: Option<PathBuf>,
+
+    /// SHA-256 fingerprint of the remote LXD server certificate (hex, case-
+    /// insensitive, colons optional). When set, the TLS handshake pins trust to
+    /// this digest and skips CA/hostname verification.
+    #[arg(long, requires = "lxd_url", conflicts_with_all = ["lxd_server_ca", "lxd_server_cert"])]
+    pub lxd_server_fingerprint: Option<String>,
 
     /// gRPC port the gateway listens on, used to build OPENSHELL_ENDPOINT for
     /// sandboxes when --gateway-endpoint is unset. The host is then resolved

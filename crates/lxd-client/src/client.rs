@@ -106,6 +106,11 @@ pub struct LxdHttpsConfig {
     /// addresses, so this is how an LXD reached by IP address is verified.
     /// Takes precedence over `server_ca`.
     pub server_cert: Option<PathBuf>,
+    /// SHA-256 fingerprint of the LXD server certificate, as hex (case-
+    /// insensitive, colons optional). When set, the TLS handshake pins trust
+    /// to this exact digest and skips CA/hostname verification.
+    /// Mutually exclusive with `server_ca` and `server_cert`.
+    pub server_fingerprint: Option<String>,
 }
 
 impl LxdHttpsConfig {
@@ -188,6 +193,22 @@ impl LxdHttpsConfig {
                 reason: format!("TLS protocol error: {e}"),
             })?;
 
+        if let Some(fingerprint) = &self.server_fingerprint {
+            let fingerprint = parse_fingerprint(fingerprint)?;
+            let verifier = FingerprintVerifier {
+                fingerprint,
+                provider,
+            };
+            let tls_config = builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(verifier))
+                .with_client_auth_cert(client_certs, key)
+                .map_err(|e| LxdError::Tls {
+                    reason: format!("TLS cert error: {e}"),
+                })?;
+            return Ok(tokio_rustls::TlsConnector::from(Arc::new(tls_config)));
+        }
+
         if let Some(cert_path) = &self.server_cert {
             let cert_file = File::open(cert_path).map_err(|e| LxdError::Tls {
                 reason: format!("cannot open server cert: {e}"),
@@ -250,6 +271,98 @@ impl LxdHttpsConfig {
             })?;
 
         Ok(tokio_rustls::TlsConnector::from(Arc::new(tls_config)))
+    }
+}
+
+/// Normalises a user-supplied SHA-256 fingerprint to a 32-byte array.
+///
+/// Accepts lower or upper case hex and optional colon separators. Anything
+/// else is rejected so malformed input fails fast at client construction.
+fn parse_fingerprint(input: &str) -> Result<[u8; 32], LxdError> {
+    let hex = input.to_ascii_lowercase().replace(':', "");
+    if hex.len() != 64 {
+        return Err(LxdError::Tls {
+            reason: format!(
+                "invalid fingerprint length: expected 64 hex chars, got {}",
+                hex.len()
+            ),
+        });
+    }
+    let mut bytes = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let chunk_str = std::str::from_utf8(chunk).expect("hex is ASCII");
+        bytes[i] = u8::from_str_radix(chunk_str, 16).map_err(|e| LxdError::Tls {
+            reason: format!("invalid fingerprint hex: {e}"),
+        })?;
+    }
+    Ok(bytes)
+}
+
+/// rustls `ServerCertVerifier` that pins trust to a single certificate SHA-256
+/// fingerprint instead of a CA trust anchor and hostname.
+///
+/// When the presented end-entity certificate digest matches the pinned digest
+/// the handshake succeeds; otherwise it is aborted before any application data
+/// flows. Signature verification is delegated to the ring crypto provider so
+/// TLS 1.2/1.3 signatures are still validated.
+#[derive(Debug)]
+struct FingerprintVerifier {
+    fingerprint: [u8; 32],
+    provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use subtle::ConstantTimeEq;
+        let digest = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
+        if digest.as_ref().ct_eq(&self.fingerprint).into() {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "server certificate fingerprint mismatch".into(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -905,6 +1018,65 @@ mod tests {
             client.decorate_path("/1.0/instances"),
             "/1.0/instances?project=my+project"
         );
+    }
+
+    #[test]
+    fn parse_fingerprint_accepts_valid_hex() {
+        let hex = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+        assert!(parse_fingerprint(hex).is_ok());
+
+        // Colons and uppercase
+        let colon_hex = "A1:B2:C3:D4:E5:F6:07:18:29:3A:4B:5C:6D:7E:8F:90:A1:B2:C3:D4:E5:F6:07:18:29:3A:4B:5C:6D:7E:8F:90";
+        assert_eq!(
+            parse_fingerprint(colon_hex).unwrap(),
+            parse_fingerprint(hex).unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_fingerprint_rejects_invalid_hex() {
+        assert!(parse_fingerprint("too short").is_err());
+        assert!(parse_fingerprint(
+            "not_hex_chars_at_all_012345678901234567890123456789012345678901234567"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn fingerprint_verifier_matches_sha256() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+        let cert_bytes = vec![10, 20, 30, 40];
+        let digest = ring::digest::digest(&ring::digest::SHA256, &cert_bytes);
+        let mut fp = [0u8; 32];
+        fp.copy_from_slice(digest.as_ref());
+
+        let verifier = FingerprintVerifier {
+            fingerprint: fp,
+            provider: std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+        };
+        let name = ServerName::try_from("192.168.1.166").unwrap();
+
+        assert!(verifier
+            .verify_server_cert(
+                &CertificateDer::from(cert_bytes),
+                &[],
+                &name,
+                &[],
+                UnixTime::now()
+            )
+            .is_ok());
+
+        assert!(verifier
+            .verify_server_cert(
+                &CertificateDer::from(vec![10, 20, 30, 41]),
+                &[],
+                &name,
+                &[],
+                UnixTime::now()
+            )
+            .is_err());
     }
 
     #[test]

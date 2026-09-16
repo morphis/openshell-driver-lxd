@@ -237,8 +237,10 @@ and loopback addresses, so a server reached by IP address fails ordinary
 verification. Pass the certificate LXD presents with `--lxd-server-cert` to
 trust exactly that certificate, as `lxc remote add` does; on a cluster member
 such as a MicroCloud node that is `/var/snap/lxd/common/lxd/cluster.crt`.
-`--lxd-server-ca` instead verifies against a CA, including the host name. Trust
-the client certificate in LXD restricted to the driver's project:
+Alternatively, pin the SHA-256 fingerprint of the server certificate with
+`--lxd-server-fingerprint` (hex, colons optional), which skips CA and hostname
+checks. `--lxd-server-ca` instead verifies against a CA, including the host name.
+Trust the client certificate in LXD restricted to the driver's project:
 `lxc config trust add client.crt --restricted --projects <project>`.
 
 ### Reaching the gateway

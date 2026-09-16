@@ -27,6 +27,8 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 webpki-roots = { workspace = true }
+ring = "0.17"
+subtle = "2"
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 strum = { workspace = true }

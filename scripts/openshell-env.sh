@@ -203,7 +203,9 @@ build_driver() {
 bridge_ipv4() {
     local cidr
     cidr="$(lxc network get lxdbr0 ipv4.address </dev/null)"
-    [ -n "$cidr" ] && [ "$cidr" != "none" ] || die "lxdbr0 has no IPv4 address"
+    if [ -z "$cidr" ] || [ "$cidr" = "none" ]; then
+        die "lxdbr0 has no IPv4 address"
+    fi
     echo "${cidr%/*}"
 }
 
