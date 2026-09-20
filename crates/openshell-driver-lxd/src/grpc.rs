@@ -382,6 +382,7 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
             devices: HashMap::new(),
+            expanded_devices: HashMap::new(),
             type_: "container".to_string(),
             project: "default".to_string(),
         }

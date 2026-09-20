@@ -150,6 +150,24 @@ impl LxdClient {
         guest_path: &str,
         content: &[u8],
     ) -> Result<(), LxdError> {
+        self.push_file_into_instance_as(name, guest_path, content, 0, 0, "0400")
+            .await
+    }
+
+    /// [`Self::push_file_into_instance`], with an explicit owner and mode.
+    ///
+    /// Anything the workload itself must read has to be owned by the workload's
+    /// own uid: it runs unprivileged, so a root-owned `0400` file is invisible
+    /// to it. The ids are the container's, not the host's — LXD maps them.
+    pub async fn push_file_into_instance_as(
+        &self,
+        name: &str,
+        guest_path: &str,
+        content: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: &str,
+    ) -> Result<(), LxdError> {
         // LXD's file-push API does not create missing parent directories, so
         // create each ancestor first. The old purpose-built sandbox image
         // shipped the token directory as a placeholder; with arbitrary base
@@ -162,15 +180,56 @@ impl LxdClient {
             &format!("/1.0/instances/{name}/files?path={encoded_path}"),
             "application/octet-stream",
             &[
-                ("X-LXD-uid", "0"),
-                ("X-LXD-gid", "0"),
-                ("X-LXD-mode", "0400"),
+                ("X-LXD-uid", uid.to_string().as_str()),
+                ("X-LXD-gid", gid.to_string().as_str()),
+                ("X-LXD-mode", mode),
                 ("X-LXD-type", "file"),
                 ("X-LXD-write", "overwrite"),
             ],
             hyper::body::Bytes::copy_from_slice(content),
         )
         .await
+    }
+
+    /// Creates one directory inside the container with an explicit owner.
+    ///
+    /// The workload boundary deletes its own one-use bootstrap after reading
+    /// it, which needs write access to the containing directory, not just the
+    /// file — so that directory has to belong to the workload, not to root.
+    pub async fn create_dir_in_instance_as(
+        &self,
+        name: &str,
+        guest_path: &str,
+        uid: u32,
+        gid: u32,
+        mode: &str,
+    ) -> Result<(), LxdError> {
+        self.create_parent_dirs_in_instance(name, guest_path)
+            .await?;
+        let encoded_path = encode(guest_path);
+        let result = self
+            .post_raw(
+                &format!("/1.0/instances/{name}/files?path={encoded_path}"),
+                "application/octet-stream",
+                &[
+                    ("X-LXD-uid", uid.to_string().as_str()),
+                    ("X-LXD-gid", gid.to_string().as_str()),
+                    ("X-LXD-mode", mode),
+                    ("X-LXD-type", "directory"),
+                ],
+                hyper::body::Bytes::new(),
+            )
+            .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if self.path_is_dir_in_instance(name, guest_path).await {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// Creates every ancestor directory of `guest_path` inside the container,
