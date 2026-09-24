@@ -737,6 +737,34 @@ impl SkopeoImporter {
     /// Creates the scratch directory for one conversion inside the configured
     /// work dir, rather than `TMPDIR`/`/tmp`, which is a small tmpfs on most
     /// modern distributions and cannot hold an unpacked sandbox rootfs.
+    /// A `skopeo` command with its registry credentials pinned to this
+    /// driver's own.
+    ///
+    /// skopeo otherwise walks an ambient chain of credential files, and on a
+    /// host where another user's container runtime has created
+    /// `/run/containers` — root-only, as podman makes it — it fails the whole
+    /// pull with `permission denied` on a file it was only probing for. The
+    /// driver's registry access must not depend on what else the host happens
+    /// to run, so it names the file itself.
+    ///
+    /// An operator who has credentials to supply sets `REGISTRY_AUTH_FILE` (or
+    /// `DOCKER_CONFIG`) on the driver, and that is honored: only an unset
+    /// variable is filled in.
+    fn skopeo(&self) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(&self.skopeo_path);
+        // Only `REGISTRY_AUTH_FILE` is honoured as an opt-out. `DOCKER_CONFIG`
+        // is not: setting it re-enters containers/image's ambient chain,
+        // including the root-only `/run/containers/<uid>/auth.json` that made
+        // pulls fail here in the first place.
+        if std::env::var_os("REGISTRY_AUTH_FILE").is_none() {
+            cmd.env(
+                "REGISTRY_AUTH_FILE",
+                self.work_dir.join("registry-auth.json"),
+            );
+        }
+        cmd
+    }
+
     fn scratch_dir(&self, prefix: &str) -> Result<tempfile::TempDir, DriverError> {
         std::fs::create_dir_all(&self.work_dir).map_err(|e| {
             DriverError::ImageImport(format!(
@@ -771,7 +799,8 @@ impl OciImporter for SkopeoImporter {
         //  * a plain `inspect` also paginates the repository's whole tag
         //    list, which costs ~13s on a repo with thousands of tags and is
         //    pure waste when only the digest is wanted.
-        let cmd = tokio::process::Command::new(&self.skopeo_path)
+        let cmd = self
+            .skopeo()
             .args(["inspect", "--raw", &target])
             .kill_on_drop(true)
             .output();
@@ -813,7 +842,8 @@ impl OciImporter for SkopeoImporter {
 
         // 1. skopeo copy docker://<repo>@<digest> oci:<temp_path>/oci:img
         let oci_tag_arg = format!("oci:{}:img", oci_dest.display());
-        let cmd = tokio::process::Command::new(&self.skopeo_path)
+        let cmd = self
+            .skopeo()
             .args([
                 "copy",
                 "--override-os",
@@ -1039,7 +1069,8 @@ impl OciImporter for SkopeoImporter {
 
         // 1. skopeo copy docker://<repo>@<digest> oci:<temp_path>/oci:img
         let oci_tag_arg = format!("oci:{}:img", oci_dest.display());
-        let cmd = tokio::process::Command::new(&self.skopeo_path)
+        let cmd = self
+            .skopeo()
             .args([
                 "copy",
                 "--override-os",
