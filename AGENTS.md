@@ -39,14 +39,16 @@ script.
 
 ## Rock packaging
 
-The rock definition lives in `rockcraft.yaml` (base `ubuntu@26.04`). It bundles
-`openshell-gateway` (upstream NVIDIA/OpenShell) and `openshell-driver-lxd`
-under Pebble. A second rock definition lives in `rocks/supervisor/rockcraft.yaml`
-(base `bare`); it ships the statically-linked `openshell-sandbox` boundary
-binary that the driver extracts into every sandbox, built from the same pinned
-upstream revision as the gateway. A GitHub Actions workflow
-(`.github/workflows/rock.yaml`) builds and smoke-tests both rocks
-(`tests/rock/smoke.sh`, `tests/rock/smoke-supervisor.sh`) on every push/PR to
-`main`, and assembles/pushes multi-arch OCI images and manifests to GHCR on
-push to `main` (`ghcr.io/<owner>/openshell-gateway` and
-`ghcr.io/<owner>/openshell-supervisor`).
+Three rocks, all built from one pinned upstream revision — see
+[rocks/README.md](rocks/README.md) for why that matters and how to build them:
+
+| rock | definition | contents |
+|---|---|---|
+| `openshell-gateway` | `rockcraft.yaml` | the gateway and this driver, under Pebble |
+| `openshell-supervisor` | `rocks/supervisor/rockcraft.yaml` | the out-of-workload half of a sandbox |
+| `openshell-sandbox` | `rocks/sandbox/rockcraft.yaml` | the in-workload boundary binary |
+
+A GitHub Actions workflow (`.github/workflows/rock.yaml`) packs and
+smoke-tests all three (`tests/rock/smoke*.sh`) on every push/PR to `main`, and
+assembles and pushes multi-arch OCI images and manifests to GHCR on push to
+`main` (`ghcr.io/<owner>/openshell-{gateway,supervisor,sandbox}`).

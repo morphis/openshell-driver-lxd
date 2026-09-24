@@ -1,29 +1,24 @@
 name: openshell-supervisor
-base: bare
+base: ubuntu@26.04
 build-base: ubuntu@26.04
 version: git
-summary: OpenShell sandbox boundary binary for the LXD compute driver
+summary: OpenShell supervisor companion for the LXD compute driver
 description: |
-  OCI rock shipping the OpenShell sandbox boundary binary for use with
-  openshell-driver-lxd, built from the same upstream revision as the
-  openshell-gateway rock so the two ship in lock step. The driver's README
-  warns that a supervisor from a different release than the gateway can fail
-  to sync policy and exit, and building both from one pinned revision is what
-  makes that impossible rather than merely unlikely.
+  OCI rock shipping `openshell-supervisor`, the out-of-workload half of an
+  RFC 0012 sandbox, built from the same upstream revision as the
+  openshell-gateway and openshell-sandbox rocks so all three ship in lock
+  step. Mixing releases across the halves of a sandbox is a known way to get a
+  boundary that will not attach, and building them from one pinned revision is
+  what makes that impossible rather than merely unlikely.
 
-  Note the naming: the driver calls this the *supervisor* image
-  (`--supervisor-image`), but what it extracts from it is `/openshell-sandbox`,
-  the in-workload boundary binary. The flag name and the binary name disagree
-  upstream; this rock follows the flag, and ships the binary the driver
-  actually looks for.
+  Unlike the sandbox rock, this one **is run**: openshell-driver-lxd converts
+  it into an LXD image and boots the companion container from it. So it is a
+  rootfs, not a binary carrier. The driver replaces the image's init with its
+  own shell script, which needs a real `/bin/sh`, `ip` and the usual text
+  tools; upstream's released supervisor image is distroless and has none of
+  them, which is why this rock is Ubuntu-based rather than `bare`.
 
-  openshell-driver-lxd never runs this image. It extracts `/openshell-sandbox`
-  into a digest-keyed LXD storage volume and mounts that into the workload
-  container, whose rootfs is the user's own image. The rock is therefore
-  `bare`: everything except the binary would be dead weight. The binary is
-  statically linked against musl because the libc of the image it lands in is
-  unknown, and the driver requires a regular file at the image root — it
-  rejects a symlink there.
+  The binary sits at `/openshell-supervisor`.
 license: Apache-2.0
 
 platforms:
@@ -31,70 +26,52 @@ platforms:
   arm64:
 
 parts:
-  sandbox:
-    plugin: nil
+  supervisor:
+    plugin: rust
     source: https://github.com/NVIDIA/OpenShell.git
-    # Must match the `gateway` part of ../../rockcraft.yaml.
-    source-commit: d1155aa70042d3e2ee49dbfa15346b108b7c1d92 # v0.0.116
+    # Must match the `gateway` part of ../../rockcraft.yaml and the `sandbox`
+    # part of ../sandbox/rockcraft.yaml.
+    source-commit: a8f98ec09de502bad1edc5b1a903382d27b8be0e # v0.1.0-pre.11
+    source-subdir: crates/openshell-supervisor
     build-packages:
       - build-essential
-      - ca-certificates
       - clang
       - cmake
-      - file
       - libclang-dev
       - libprotobuf-dev
-      - musl-dev
-      - musl-tools
+      - libssl-dev
       - pkg-config
       - protobuf-compiler
-    # The rust plugin has no way to select a target and this binary has to be
-    # built for musl, so the toolchain is driven by hand. It comes from the
-    # store-signed snap rather than from piping sh.rustup.rs into a shell: this
-    # binary is what enforces the sandbox boundary inside every sandbox, so
-    # "built from one pinned revision" has to cover the thing doing the
-    # building too. craft-parts reads the snap's confinement from the store and
-    # installs a classic one with --classic.
-    build-snaps:
-      - rustup/latest/stable
+
+  # The driver's init script runs before the supervisor and needs these; the
+  # supervisor itself needs the trust store to verify the gateway. They are
+  # what make this a usable companion rootfs rather than a distroless one.
+  runtime-deps:
+    plugin: nil
+    stage-packages:
+      - ca-certificates
+      - curl
+      - iproute2
+      - libssl3t64
+
+  config:
+    plugin: nil
+    after:
+      - supervisor
+      - runtime-deps
     override-build: |
-      set -eu
-
-      case "${CRAFT_ARCH_BUILD_FOR}" in
-        amd64) target=x86_64-unknown-linux-musl ;;
-        arm64) target=aarch64-unknown-linux-musl ;;
-        *) echo "unsupported architecture ${CRAFT_ARCH_BUILD_FOR}" >&2; exit 1 ;;
-      esac
-
-      # Keep rustup's state inside the part so nothing leaks between builds.
-      export RUSTUP_HOME="${CRAFT_PART_BUILD}/rustup"
-      export CARGO_HOME="${CRAFT_PART_BUILD}/cargo"
-
-      # Upstream ships a rust-toolchain.toml, so the toolchain in use here is
-      # the one that file pins, and the musl target has to be added to *that*
-      # toolchain. `rustup.cargo` is rustup's own shim, so it resolves the same
-      # toolchain as this command does.
-      rustup target add "${target}"
-
-      rustup.cargo build --release --locked --target "${target}" \
-        -p openshell-sandbox --bin openshell-sandbox
-
-      binary="target/${target}/release/openshell-sandbox"
-
-      # A dynamically linked binary here fails at run time, inside someone
-      # else's image, with a missing-loader error that says nothing about this
-      # build. Fail here instead, where the cause is obvious.
-      #
-      # Rust's musl target produces a static-PIE, which `file` reports as
-      # "static-pie linked" rather than "statically linked"; both are static,
-      # and what actually matters is that it is not dynamic.
-      description="$(file "${binary}")"
-      case "${description}" in
-        *"dynamically linked"*|*"interpreter"*)
-          echo "openshell-sandbox is not statically linked:" >&2
-          echo "${description}" >&2
-          exit 1
-          ;;
-      esac
-
-      install -D -m 0555 "${binary}" "${CRAFT_PART_INSTALL}/openshell-sandbox"
+      craftctl default
+      # ca-certificates ships the public roots and a prebuilt bundle, but its
+      # postinst — which writes /etc/ca-certificates.conf — never runs in a
+      # rock. Without that file, anything that calls update-ca-certificates
+      # rebuilds the bundle from an empty list and silently drops every public
+      # root, and the supervisor can no longer verify the gateway. The roots
+      # come from the runtime-deps part, so read them from the shared stage
+      # directory rather than this part's own install dir.
+      roots="${CRAFT_STAGE}/usr/share/ca-certificates"
+      if [ -d "${roots}" ]; then
+        install -d -m 0755 "${CRAFT_PART_INSTALL}/etc"
+        ( cd "${roots}" && find . -name '*.crt' -printf '%P\n' | sort ) \
+          > "${CRAFT_PART_INSTALL}/etc/ca-certificates.conf"
+        chmod 0644 "${CRAFT_PART_INSTALL}/etc/ca-certificates.conf"
+      fi

@@ -6,7 +6,7 @@ on:
       - main
     paths:
       - rockcraft.yaml
-      - rocks/supervisor/**
+      - rocks/**
       - tests/rock/**
       - crates/**
       - proto/**
@@ -15,7 +15,7 @@ on:
   pull_request:
     paths:
       - rockcraft.yaml
-      - rocks/supervisor/**
+      - rocks/**
       - tests/rock/**
       - crates/**
       - proto/**
@@ -34,56 +34,44 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # `path` is the rockcraft.yaml's directory; the gateway rock's is the
+        # repository root, which rockcraft-pack takes as an empty path.
+        rock: [gateway, supervisor, sandbox]
+        arch: [amd64, arm64]
         include:
           - arch: amd64
             runner: ubuntu-26.04
-            rock: gateway
           - arch: arm64
             runner: ubuntu-26.04-arm
-            rock: gateway
-          - arch: amd64
-            runner: ubuntu-26.04
-            rock: supervisor
-          - arch: arm64
-            runner: ubuntu-26.04-arm
-            rock: supervisor
+          - rock: gateway
+            path: ""
+          - rock: supervisor
+            path: rocks/supervisor
+          - rock: sandbox
+            path: rocks/sandbox
 
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      - name: Pack gateway rock
-        if: matrix.rock == 'gateway'
-        uses: canonical/craft-actions/rockcraft-pack@adff67a3dc8de1b95de1d25728bf83506ab701b2
-
-      - name: Pack supervisor rock
-        if: matrix.rock == 'supervisor'
+      - name: Pack rock
         uses: canonical/craft-actions/rockcraft-pack@adff67a3dc8de1b95de1d25728bf83506ab701b2
         with:
-          path: rocks/supervisor
+          path: ${{ matrix.path }}
 
-      - name: Run gateway smoke tests
-        if: matrix.rock == 'gateway'
-        run: tests/rock/smoke.sh
+      - name: Run smoke tests
+        run: |
+          if [ "${{ matrix.rock }}" = "gateway" ]; then
+            tests/rock/smoke.sh
+          else
+            ROCK_DIR="${{ matrix.path }}" "tests/rock/smoke-${{ matrix.rock }}.sh"
+          fi
 
-      - name: Run supervisor smoke tests
-        if: matrix.rock == 'supervisor'
-        run: ROCK_DIR=rocks/supervisor tests/rock/smoke-supervisor.sh
-
-      - name: Upload gateway rock artifact
-        if: matrix.rock == 'gateway'
+      - name: Upload rock artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: rock-gateway-${{ matrix.arch }}
-          path: "*.rock"
-          if-no-files-found: error
-
-      - name: Upload supervisor rock artifact
-        if: matrix.rock == 'supervisor'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: supervisor-rock-${{ matrix.arch }}
-          path: rocks/supervisor/*.rock
+          name: rock-${{ matrix.rock }}-${{ matrix.arch }}
+          path: ${{ matrix.path != '' && format('{0}/*.rock', matrix.path) || '*.rock' }}
           if-no-files-found: error
 
   manifest:
@@ -100,29 +88,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      - name: Download amd64 gateway rock
+      - name: Download rocks
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: rock-gateway-amd64
-          path: dist/gateway/amd64
-
-      - name: Download arm64 gateway rock
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: rock-gateway-arm64
-          path: dist/gateway/arm64
-
-      - name: Download amd64 supervisor rock
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: supervisor-rock-amd64
-          path: dist/supervisor/amd64
-
-      - name: Download arm64 supervisor rock
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: supervisor-rock-arm64
-          path: dist/supervisor/arm64
+          pattern: rock-*
+          path: dist
 
       - name: Install skopeo
         run: |
@@ -134,25 +104,21 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" \
             | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      # All three rocks are built from one pinned upstream revision and have to
+      # be published together: a gateway, a supervisor companion and a workload
+      # boundary from different revisions do not make a working sandbox.
       - name: Push arch-specific images and assemble manifests
         run: |
           OWNER="${{ github.repository_owner }}"
           SHA="${{ github.sha }}"
 
-          # Rocks and where their artifacts were downloaded to.
-          declare -A DIRS=(
-            [openshell-gateway]="dist/gateway"
-            [openshell-supervisor]="dist/supervisor"
-          )
-
-          for NAME in openshell-gateway openshell-supervisor; do
-            DIR="${DIRS[${NAME}]}"
-            IMAGE="ghcr.io/${OWNER}/${NAME}"
+          for ROCK in gateway supervisor sandbox; do
+            IMAGE="ghcr.io/${OWNER}/openshell-${ROCK}"
 
             for ARCH in amd64 arm64; do
-              ROCK=$(find "${DIR}/${ARCH}" -maxdepth 1 -name "*.rock" | head -1)
+              FILE=$(find "dist/rock-${ROCK}-${ARCH}" -maxdepth 1 -name "*.rock" | head -1)
               skopeo copy \
-                "oci-archive:${ROCK}" \
+                "oci-archive:${FILE}" \
                 "docker://${IMAGE}:${SHA}-${ARCH}"
               skopeo copy \
                 "docker://${IMAGE}:${SHA}-${ARCH}" \
@@ -175,12 +141,12 @@ jobs:
           OWNER="${{ github.repository_owner }}"
           SHA="${{ github.sha }}"
 
-          for NAME in openshell-gateway openshell-supervisor; do
-            IMAGE="ghcr.io/${OWNER}/${NAME}"
+          for ROCK in gateway supervisor sandbox; do
+            IMAGE="ghcr.io/${OWNER}/openshell-${ROCK}"
             MANIFEST=$(docker manifest inspect "${IMAGE}:${SHA}")
             echo "$MANIFEST" | grep -qE '"architecture"[[:space:]]*:[[:space:]]*"amd64"' \
-              || (echo "ERROR: amd64 missing from ${NAME} manifest" && exit 1)
+              || (echo "ERROR: amd64 missing from ${ROCK} manifest" && exit 1)
             echo "$MANIFEST" | grep -qE '"architecture"[[:space:]]*:[[:space:]]*"arm64"' \
-              || (echo "ERROR: arm64 missing from ${NAME} manifest" && exit 1)
-            echo "Multi-arch manifest OK for ${NAME}: both linux/amd64 and linux/arm64 present."
+              || (echo "ERROR: arm64 missing from ${ROCK} manifest" && exit 1)
+            echo "Multi-arch manifest OK for ${ROCK}: both linux/amd64 and linux/arm64 present."
           done

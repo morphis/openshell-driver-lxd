@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # Smoke test for the openshell-supervisor rock.
 # Invoked by the CI build job after rockcraft-pack.
-# Proves: the image ships exactly the boundary binary the driver extracts,
-# at the path the driver looks for, as a regular (non-symlink) statically
-# linked executable. The rock is `base: bare`, so there is no shell inside
-# the image and every check runs from the host.
+#
+# Unlike the sandbox rock, this image is *run*: the driver converts it into an
+# LXD image and boots the companion container from it, after replacing its init
+# with the driver's own shell script. So the checks here are about it being a
+# usable rootfs — the binary, and the handful of programs that script needs —
+# rather than about it containing nothing else.
 set -euo pipefail
 
 ROCK_DIR="${ROCK_DIR:-rocks/supervisor}"
 IMAGE="openshell-supervisor:test"
-BINARY="openshell-sandbox"
+BINARY="openshell-supervisor"
 
 # ---------------------------------------------------------------------------
 # Guard: Docker daemon must be available to the current user (no sudo).
@@ -35,71 +37,52 @@ echo "Using skopeo: ${SKOPEO}"
 # applicable here.
 "${SKOPEO}" copy --insecure-policy "oci-archive:${ROCK_FILE}" "docker-daemon:${IMAGE}"
 
-# The image has no shell and no entrypoint to run, so create a stopped
-# container and inspect its filesystem from the host.
-CONTAINER=$(docker create "${IMAGE}")
-trap 'docker rm -f "${CONTAINER}" > /dev/null 2>&1' EXIT
+run() {
+  docker run --rm --entrypoint "$1" "${IMAGE}" "${@:2}"
+}
 
 # ---------------------------------------------------------------------------
-# 1. /openshell-sandbox exists at the image root, as a regular file.
-#    The driver rejects a symlink there, so check the tar entry type.
+# 1. The supervisor binary is at the image root and runs.
+#
+#    `--version` is the cheapest thing it will do without a descriptor or an
+#    auth bundle, both of which it otherwise refuses to start without.
 # ---------------------------------------------------------------------------
-echo "==> Check: ${BINARY} present at image root as a regular file"
-ENTRY_TYPE=$(docker export "${CONTAINER}" | tar -tvf - | awk -v binary="${BINARY}" '
-  {
-    path = $NF
-    sub("^\\./", "", path)
-    sub("^/", "", path)
-    if (path == binary) {
-      res = substr($1, 1, 1)
-    }
-  }
-  END {
-    if (res) print res
-  }')
-if [[ -z "${ENTRY_TYPE}" ]]; then
-  echo "ERROR: /${BINARY} not found in the image" >&2
-  exit 1
-fi
-[[ "${ENTRY_TYPE}" == "-" ]] \
-  || { echo "ERROR: /${BINARY} is not a regular file (tar type '${ENTRY_TYPE}'); the driver rejects anything but a regular file there" >&2; exit 1; }
+echo "==> Check: /${BINARY} runs"
+VERSION=$(run "/${BINARY}" --version)
+echo "    ${VERSION}"
+[[ -n "${VERSION}" ]] \
+  || { echo "ERROR: /${BINARY} printed no version" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
-# 2. The binary is executable.
+# 2. It refuses to start without its RFC 0012 inputs, which is what tells us
+#    this is a v0.1.0 supervisor and not an older combined one. A combined
+#    supervisor accepts an empty argument list and starts supervising.
 # ---------------------------------------------------------------------------
-echo "==> Check: ${BINARY} is executable"
-WORK_DIR=$(mktemp -d)
-trap 'docker rm -f "${CONTAINER}" > /dev/null 2>&1; rm -rf "${WORK_DIR}"' EXIT
-docker cp "${CONTAINER}:/${BINARY}" "${WORK_DIR}/${BINARY}"
-test -x "${WORK_DIR}/${BINARY}"
+echo "==> Check: ${BINARY} takes the RFC 0012 inputs"
+HELP=$(run "/${BINARY}" --help)
+for FLAG in --backend-descriptor-file --auth-bundle-file; do
+  grep -q -- "${FLAG}" <<<"${HELP}" \
+    || { echo "ERROR: ${BINARY} does not accept ${FLAG}; this is not an RFC 0012 supervisor" >&2; exit 1; }
+done
 
 # ---------------------------------------------------------------------------
-# 3. The binary is statically linked.
-#    Rust's musl target produces a static-PIE, which `file` reports as
-#    "static-pie linked" rather than "statically linked"; both are static,
-#    and what actually matters is that it is not dynamic.
+# 3. The programs the driver's init script needs before the supervisor runs.
+#    Upstream's released supervisor image is distroless and has none of them,
+#    which is the reason this rock exists.
 # ---------------------------------------------------------------------------
-echo "==> Check: ${BINARY} is statically linked"
-DESCRIPTION=$(file "${WORK_DIR}/${BINARY}")
-case "${DESCRIPTION}" in
-  *"dynamically linked"*|*"interpreter"*)
-    echo "ERROR: /${BINARY} is not statically linked:" >&2
-    echo "${DESCRIPTION}" >&2
-    exit 1
-    ;;
-esac
+echo "==> Check: the init script's dependencies are present"
+for PROGRAM in /bin/sh /usr/bin/getent /usr/bin/curl; do
+  run /bin/sh -c "test -x ${PROGRAM}" \
+    || { echo "ERROR: ${PROGRAM} is missing; the driver's init script needs it" >&2; exit 1; }
+done
 
 # ---------------------------------------------------------------------------
-# 4. The image ships nothing else at its root beyond the binary and the
-#    baseline OCI scaffolding — the rock is bare, everything else is dead
-#    weight that would end up digest-keyed into every sandbox volume.
+# 4. The trust store survives an update. ca-certificates' postinst never runs
+#    in a rock, so without this file update-ca-certificates rebuilds the
+#    bundle from an empty list and drops every public root.
 # ---------------------------------------------------------------------------
-echo "==> Check: image rootfs contains nothing beyond the binary and baseline entries"
-EXTRA=$(docker export "${CONTAINER}" | tar -tf - | sed -e 's/^\.\///' -e 's/\/.*$//' | sort -u | grep -v -E "^(${BINARY}|\.dockerenv|\.rock|dev|etc|proc|root|sys|tmp|usr|var)$" || true)
-if [[ -n "${EXTRA}" ]]; then
-  echo "ERROR: unexpected entries in the image root:" >&2
-  echo "${EXTRA}" >&2
-  exit 1
-fi
+echo "==> Check: /etc/ca-certificates.conf lists the shipped roots"
+run /bin/sh -c 'test -s /etc/ca-certificates.conf' \
+  || { echo "ERROR: /etc/ca-certificates.conf is missing or empty" >&2; exit 1; }
 
 echo "All supervisor smoke checks passed."

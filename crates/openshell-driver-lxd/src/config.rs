@@ -35,19 +35,37 @@ pub use lxd_client::DEFAULT_PROJECT;
 
 /// Default OCI image the supervisor companion container runs from.
 ///
-/// Upstream's released image is distroless, so the driver injects a static
-/// busybox during conversion to run its init script. This repository's
-/// `openshell-supervisor` rock is Ubuntu-based and needs no such help — and,
-/// unlike the released image, carries the `Lxd` driver fence variant the
-/// boundary requires. See `rocks/README.md`.
-pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:0.1.0-pre.3";
+/// Pinned by digest, and to the *commit* tag rather than a release one:
+/// upstream publishes these images per commit and stopped tagging them with a
+/// version after `0.1.0-pre.8`, while `latest` moves without warning. A
+/// digest is also the only reliable freshness signal here — the version
+/// strings these images report have been observed to be identical across
+/// builds that behave differently.
+///
+/// The commit is v0.1.0-pre.11, the same revision `rockcraft.yaml` and both
+/// rocks under `rocks/` build from: the gateway, the supervisor companion and
+/// the workload boundary have to come from one revision or a sandbox does not
+/// attach.
+///
+/// Upstream's image is distroless, so the driver injects a static busybox
+/// during conversion to run its init script. This repository's
+/// `openshell-supervisor` rock is Ubuntu-based and needs no such help; prefer
+/// it where it is available.
+pub const DEFAULT_SUPERVISOR_IMAGE: &str = concat!(
+    "ghcr.io/nvidia/openshell/supervisor:a8f98ec09de502bad1edc5b1a903382d27b8be0e",
+    "@sha256:79f6c249f492bb3ed8079d72fc3ae6595d03b63db800d92df63d713ebf72fe4b"
+);
 
 /// Default OCI image the `openshell-sandbox` binary is extracted from.
 ///
 /// Never run as a rootfs: the driver copies `/openshell-sandbox` out of it
 /// into a digest-keyed volume and mounts that into the workload container,
-/// whose own image supplies the rootfs.
-pub const DEFAULT_SANDBOX_BINARY_IMAGE: &str = "ghcr.io/nvidia/openshell/sandbox:0.1.0-pre.3";
+/// whose own image supplies the rootfs. Pinned like
+/// [`DEFAULT_SUPERVISOR_IMAGE`], and to the same revision.
+pub const DEFAULT_SANDBOX_BINARY_IMAGE: &str = concat!(
+    "ghcr.io/nvidia/openshell/sandbox:a8f98ec09de502bad1edc5b1a903382d27b8be0e",
+    "@sha256:62338c8f73ebfec23270c4532b1b1f77d50591764f72a5d919b4d6227abceb72"
+);
 
 /// Default host cache directory for extracted supervisor binaries.
 pub const DEFAULT_SUPERVISOR_CACHE_DIR: &str = "/var/cache/openshell/lxd-supervisor";
