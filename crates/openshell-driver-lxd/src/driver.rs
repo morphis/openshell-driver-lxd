@@ -438,6 +438,20 @@ impl LxdComputeDriver {
             ));
         }
 
+        // `user_namespaces` is a portable intent each driver maps to its own
+        // platform. An LXD container is unprivileged, and therefore user-
+        // namespaced, unless it is explicitly made privileged — so `true` and
+        // "unset" are both already true here. `false` asks for a privileged
+        // container, which would hand the workload host-uid semantics; refuse
+        // rather than quietly provide the opposite of what was asked for.
+        if template.user_namespaces == Some(false) {
+            return Err(DriverError::InvalidArgument(
+                "user_namespaces = false asks for a sandbox outside a user namespace, which on \
+                 LXD means a privileged container; this driver does not provision one"
+                    .into(),
+            ));
+        }
+
         // An empty image means the default image, which is validated when it
         // is resolved.
         if !template.image.is_empty() {
@@ -2269,6 +2283,38 @@ mod tests {
             permissive.resource_admission_policy,
             driver().capabilities().resource_admission_policy
         );
+    }
+
+    /// An LXD container is user-namespaced unless it is made privileged, so
+    /// the only answer this driver can give to `false` is "no".
+    #[tokio::test]
+    async fn validate_sandbox_create_refuses_a_sandbox_outside_a_user_namespace() {
+        let mut spec = spec_with_labels(HashMap::new());
+        spec.template.as_mut().unwrap().user_namespaces = Some(false);
+
+        let error = driver()
+            .validate_sandbox_create(&sandbox_with_spec(spec))
+            .await
+            .expect_err("a privileged container is not on offer");
+        assert!(
+            matches!(error, DriverError::InvalidArgument(_)),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_sandbox_create_accepts_the_user_namespace_it_already_provides() {
+        for requested in [None, Some(true)] {
+            let mut spec = spec_with_labels(HashMap::new());
+            spec.template.as_mut().unwrap().user_namespaces = requested;
+
+            driver()
+                .validate_sandbox_create(&sandbox_with_spec(spec))
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("user_namespaces = {requested:?} should be accepted: {e}")
+                });
+        }
     }
 
     #[tokio::test]
