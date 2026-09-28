@@ -1417,15 +1417,36 @@ impl LxdComputeDriver {
         .await
     }
 
-    /// Re-resolves identity for a restart, where the original request is gone
-    /// but the image — and therefore the identity it resolves to — is the same.
+    /// Re-resolves identity for a restart.
+    ///
+    /// The original request is gone — `StartSandboxRequest` carries no
+    /// template — so the selectors the gateway admitted are read back from
+    /// the instance, where create recorded them. Resolving with none, as this
+    /// used to, silently answered a different question: a sandbox admitted
+    /// with `run_as_user: appuser` came back after a stop running as whatever
+    /// the image suggested instead, losing access to the `/sandbox` its first
+    /// boot was given and leaving the companion attesting an identity the
+    /// policy never asked for.
     async fn resolve_workload_identity_from_instance(
         &self,
-        instance: &str,
+        instance: &lxd_client::Instance,
         resource_digest: &str,
     ) -> Result<isolation::ResolvedWorkloadIdentity, DriverError> {
-        self.resolve_identity_against_image(instance, "", "", resource_digest)
-            .await
+        let selector = |key: &str| {
+            instance
+                .config
+                .get(key)
+                .map(String::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        self.resolve_identity_against_image(
+            &instance.name,
+            &selector(mapping::KEY_WORKLOAD_USER),
+            &selector(mapping::KEY_WORKLOAD_GROUP),
+            resource_digest,
+        )
+        .await
     }
 
     async fn resolve_identity_against_image(
@@ -1816,7 +1837,7 @@ impl LxdComputeDriver {
                 .cloned()
                 .unwrap_or_default();
             let identity = self
-                .resolve_workload_identity_from_instance(name, &image_alias)
+                .resolve_workload_identity_from_instance(&instance, &image_alias)
                 .await?;
             // A sandbox that comes back after the gateway moved has to
             // reach the new address, and its own ACL is the only place that

@@ -61,6 +61,16 @@ pub(crate) const KEY_IMAGE_ALIAS: &str = "user.openshell.image_alias";
 /// says nothing about what this sandbox is already running with.
 pub(crate) const KEY_CALLER_DRIVER_CONFIG: &str = "user.openshell.caller_driver_config_used";
 
+/// The workload-identity selectors the gateway admitted, verbatim.
+///
+/// `StartSandboxRequest` carries no template, so a start has no way to learn
+/// that the policy asked for `run_as_user: appuser`. Re-resolving against the
+/// image with no selectors would answer a different question — "who does this
+/// image suggest?" rather than "who was this sandbox admitted to run as?" —
+/// and quietly run the workload as somebody else from its second boot on.
+pub(crate) const KEY_WORKLOAD_USER: &str = "user.openshell.workload_user";
+pub(crate) const KEY_WORKLOAD_GROUP: &str = "user.openshell.workload_group";
+
 /// The declared environment, as JSON, for the workload's processes only.
 ///
 /// It cannot be read back off the instance's own `environment.*` keys: those
@@ -515,7 +525,20 @@ pub fn build_create_config(
         format!("{ENV_PREFIX}OPENSHELL_LOG_LEVEL"),
         log_level.to_string(),
     );
-    let _ = spec;
+
+    // Recorded so a later start resolves the identity the gateway admitted,
+    // not whatever the image would suggest on its own. Empty selectors are
+    // left out: absent and "unset" mean the same thing to the resolver.
+    if let Some(identity) = spec.workload_identity.as_ref() {
+        for (key, value) in [
+            (KEY_WORKLOAD_USER, identity.user.trim()),
+            (KEY_WORKLOAD_GROUP, identity.group.trim()),
+        ] {
+            if !value.is_empty() {
+                config.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
 
     config.insert(
         KEY_CALLER_DRIVER_CONFIG.to_string(),
@@ -1885,6 +1908,51 @@ mod tests {
             Some("sb-123")
         );
         assert!(!config.contains_key("environment.OPENSHELL_SANDBOX"));
+    }
+
+    /// `StartSandboxRequest` has no template, so the only way a restart can
+    /// run the workload as the account the policy named is for create to
+    /// write it down.
+    #[test]
+    fn the_admitted_workload_selectors_are_recorded_for_a_restart() {
+        let spec = DriverSandboxSpec {
+            workload_identity: Some(computev1::pb::WorkloadIdentityRequest {
+                user: " appuser ".to_string(),
+                group: "appgroup".to_string(),
+            }),
+            ..Default::default()
+        };
+        let config = build_create_config(
+            &identified_sandbox(),
+            &spec,
+            &DriverSandboxTemplate::default(),
+            0,
+            "info",
+        )
+        .expect("build_create_config should succeed");
+
+        assert_eq!(
+            config.get(KEY_WORKLOAD_USER).map(String::as_str),
+            Some("appuser"),
+            "the selector is recorded trimmed, as the resolver reads it"
+        );
+        assert_eq!(
+            config.get(KEY_WORKLOAD_GROUP).map(String::as_str),
+            Some("appgroup")
+        );
+
+        // Nothing requested records nothing: absent and empty mean the same
+        // thing to the resolver, and an empty key would only be noise.
+        let config = build_create_config(
+            &identified_sandbox(),
+            &DriverSandboxSpec::default(),
+            &DriverSandboxTemplate::default(),
+            0,
+            "info",
+        )
+        .expect("build_create_config should succeed");
+        assert!(!config.contains_key(KEY_WORKLOAD_USER));
+        assert!(!config.contains_key(KEY_WORKLOAD_GROUP));
     }
 
     #[test]

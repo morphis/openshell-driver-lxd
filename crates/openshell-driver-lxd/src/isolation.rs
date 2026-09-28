@@ -769,9 +769,16 @@ const DEFAULT_SANDBOX_GID: u32 = 1000;
 /// admitted and the image does not define is a mismatch worth reporting, while
 /// an image that simply ships no conventional account is ordinary.
 ///
-/// Both are resolved against the pinned image's own `/etc/passwd` and
+/// Both are resolved against the container's own `/etc/passwd` and
 /// `/etc/group`, never against the host: the numbers must mean the same thing
-/// inside the container as they do in the boundary's confirmation. Root is
+/// inside the container as they do in the boundary's confirmation.
+///
+/// At create that rootfs is the pinned image's, untouched. At start it is the
+/// rootfs as the previous run left it — a workload whose image ships a
+/// writable `/etc/passwd` can therefore choose the account its *next* boot
+/// resolves to. It stays non-root either way, and the identity the companion
+/// attests is the one the workload actually runs as, so this changes which
+/// unprivileged account it is and nothing about its privileges. Root is
 /// rejected — upstream treats UID or GID zero as invalid for a capability-free
 /// sandbox.
 pub fn resolve_workload_identity(
@@ -819,10 +826,11 @@ pub fn resolve_workload_identity(
         .iter()
         .find(|(name, uid, _)| *name == user || user.parse::<u32>().ok() == Some(*uid));
 
-    // Nothing was asked for and the image defines no conventional account:
-    // synthesize one, as upstream's own local-container drivers do rather than
-    // reject the image. OpenShell's default sandbox image is a plain Ubuntu
-    // base with no `sandbox` user, so refusing here would refuse the default.
+    // Nothing was requested and the image ships no conventional account:
+    // synthesize a numeric non-root identity rather than refuse the image.
+    // This is what upstream's own local-container drivers do, and its default
+    // sandbox image is a plain base with no `sandbox` account, so refusing
+    // here would refuse the default.
     if !asked_for && account.is_none() {
         return Ok(ResolvedWorkloadIdentity {
             uid: DEFAULT_SANDBOX_UID,
@@ -833,6 +841,17 @@ pub fn resolve_workload_identity(
         });
     }
 
+    // A selector the gateway admitted and the image does not define is an
+    // error, deliberately, and not something to paper over.
+    //
+    // It would be easy to synthesize here too — and upstream's e2e suite would
+    // then get further, because its policies name `run_as_user: sandbox` while
+    // the image its harness pins has no non-root account at all. That is not a
+    // reason to: upstream's own Podman driver refuses exactly this, in almost
+    // these words ("configure a non-root workload user present in the pinned
+    // image"), and verified doing so on the same host and revision. The
+    // mismatch is in that suite's environment, not in a driver, and a policy
+    // that names an account is asking for *that* account.
     let source = if asked_for { "policy" } else { "image" };
     let uid: u32 = user
         .parse()
@@ -841,7 +860,8 @@ pub fn resolve_workload_identity(
         .ok_or_else(|| {
             invalid(format!(
                 "workload user {user:?} is not present in the pinned image; set \
-                 spec.workload_identity.user to an account the image defines"
+                 spec.workload_identity.user, or the policy's process.run_as_user, to an \
+                 account the image defines"
             ))
         })?;
     let gid: u32 = if requested_group.is_empty() {
@@ -856,8 +876,8 @@ pub fn resolve_workload_identity(
     }
     .ok_or_else(|| {
         invalid(format!(
-            "cannot resolve a group for workload user {user:?}; set \
-             spec.workload_identity.group explicitly"
+            "cannot resolve a group for workload user {user:?}; set the policy's \
+             process.run_as_group to a group the image defines"
         ))
     })?;
 
@@ -865,6 +885,18 @@ pub fn resolve_workload_identity(
         return Err(invalid(format!(
             "workload identity {uid}:{gid} is root; OpenShell requires an \
              unprivileged workload user"
+        )));
+    }
+    // `(uid_t)-1` means "leave unchanged" to setresuid/setresgid, so an
+    // identity of u32::MAX would drop to nothing and leave the boundary as
+    // root. It fails closed downstream — upstream's own runtime qualification
+    // refuses a root euid — but a sandbox that cannot start is a worse answer
+    // than a create that says why.
+    if uid == u32::MAX || gid == u32::MAX {
+        return Err(invalid(format!(
+            "workload identity {uid}:{gid} is not a usable account: {} means \
+             \"leave unchanged\" to the kernel, so the boundary would stay root",
+            u32::MAX
         )));
     }
 
@@ -1082,17 +1114,38 @@ mod tests {
         assert!(id.supplementary_gids.is_empty());
     }
 
-    /// A selector the gateway admitted and the image does not define is a
-    /// mismatch worth reporting, and does not fall back.
+    /// A selector the gateway admitted and the image does not define is an
+    /// error, and is not synthesized away.
+    ///
+    /// Upstream's own Podman driver refuses exactly this — verified on the same
+    /// host and revision, where it fails every one of these e2e targets with
+    /// "configure a non-root workload user present in the pinned image" — so
+    /// synthesizing here would make this driver more permissive than the
+    /// in-tree ones about an explicit identity request.
     #[test]
     fn a_requested_account_the_image_lacks_is_a_clear_error() {
-        let err =
-            resolve_workload_identity("agent", "", b"root:x:0:0::/root:/bin/sh\n", GROUP, "d")
-                .unwrap_err();
+        let err = resolve_workload_identity(
+            "sandbox",
+            "sandbox",
+            b"root:x:0:0:root:/root:/bin/bash\n",
+            b"root:x:0:\n",
+            "d",
+        )
+        .unwrap_err();
         assert!(
             format!("{err}").contains("not present in the pinned image"),
             "{err}"
         );
+    }
+
+    /// A name the image *does* define is used as asked, and reported as
+    /// coming from the policy that asked for it.
+    #[test]
+    fn a_requested_account_the_image_defines_is_used() {
+        let id = resolve_workload_identity("sandbox", "", PASSWD, GROUP, "d")
+            .expect("the image defines sandbox");
+        assert_eq!((id.uid, id.gid), (1000, 1000));
+        assert_eq!(id.source, "policy");
     }
 
     /// A NIC read back exactly as a fenced sandbox's looks.
