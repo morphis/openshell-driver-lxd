@@ -50,6 +50,17 @@ pub(crate) const KEY_NETWORK_TYPE: &str = "user.openshell.network_type";
 pub(crate) const KEY_EGRESS_ACL: &str = "user.openshell.egress_acl";
 pub(crate) const KEY_IMAGE_ALIAS: &str = "user.openshell.image_alias";
 
+/// Whether the caller supplied `template.driver_config` when this sandbox was
+/// created, as `"true"` or `"false"`.
+///
+/// Upstream calls this provenance and records it the same way
+/// (`openshell.ai/caller-driver-config-used`, on the container), because the
+/// admission policy can be turned off after a sandbox exists and the config
+/// it was created with outlives the flag that allowed it. Without the record
+/// there is nothing to check at start but the flag's current value, which
+/// says nothing about what this sandbox is already running with.
+pub(crate) const KEY_CALLER_DRIVER_CONFIG: &str = "user.openshell.caller_driver_config_used";
+
 /// The declared environment, as JSON, for the workload's processes only.
 ///
 /// It cannot be read back off the instance's own `environment.*` keys: those
@@ -505,6 +516,15 @@ pub fn build_create_config(
         log_level.to_string(),
     );
     let _ = spec;
+
+    config.insert(
+        KEY_CALLER_DRIVER_CONFIG.to_string(),
+        template
+            .driver_config
+            .as_ref()
+            .is_some_and(|config| !config.fields.is_empty())
+            .to_string(),
+    );
 
     for (key, value) in &template.labels {
         if !is_valid_label_key(key) {

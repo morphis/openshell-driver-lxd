@@ -560,6 +560,42 @@ impl LxdComputeDriver {
         Ok(())
     }
 
+    /// Refuses a sandbox whose recorded driver config the policy no longer
+    /// allows.
+    ///
+    /// `allow_driver_config` gates `network`, `storage_pool`, `profiles` and
+    /// `max_processes`, so a sandbox created while it was on is running with
+    /// choices the operator has since withdrawn. Checking the flag alone at
+    /// start would say nothing about that — the flag describes what may be
+    /// asked for now, the record describes what this sandbox already has.
+    ///
+    /// Mirrors upstream's `check_config_provenance`, including its treatment
+    /// of a missing record: a sandbox that cannot say how it was created
+    /// cannot be admitted, so one from a build that did not record it has to
+    /// be recreated. Upstream's Podman and Docker drivers fail closed the
+    /// same way.
+    fn check_config_provenance(&self, instance: &lxd_client::Instance) -> Result<(), DriverError> {
+        let recorded = instance
+            .config
+            .get(mapping::KEY_CALLER_DRIVER_CONFIG)
+            .map(String::as_str);
+        match recorded {
+            Some("false") => Ok(()),
+            Some("true") if self.config.allow_driver_config => Ok(()),
+            Some("true") => Err(DriverError::FailedPrecondition(
+                "this sandbox was created with caller driver config, which is now disabled; \
+                 re-enable --allow-driver-config, or delete the sandbox and create it again \
+                 without it"
+                    .into(),
+            )),
+            _ => Err(DriverError::FailedPrecondition(
+                "this sandbox does not record whether it was created with caller driver \
+                 config, so it cannot be admitted; delete it and create it again"
+                    .into(),
+            )),
+        }
+    }
+
     /// Waits for an LXD operation to complete, bounded by
     /// `Config::operation_timeout_secs` so a hung LXD instance cannot block
     /// an RPC indefinitely.
@@ -1405,6 +1441,9 @@ impl LxdComputeDriver {
             let _guard = lifecycle_lock.lock().await;
 
             let instance = self.get_managed_instance(name).await?;
+            // The policy may have changed since this sandbox was created, and
+            // what it was created with outlives the flag that allowed it.
+            self.check_config_provenance(&instance)?;
             // Settling re-reads the instance; the id tells a restart of this
             // sandbox from one that reused the name in the meantime.
             let sandbox_id = instance
@@ -2142,6 +2181,67 @@ mod tests {
             .validate_sandbox_create(&sandbox)
             .await
             .expect("caller driver config should be accepted when allowed");
+    }
+
+    /// The flag can be turned off after a sandbox exists, and what it was
+    /// created with outlives the flag that allowed it. Checking the flag
+    /// alone at start would answer a different question.
+    #[test]
+    fn a_start_re_checks_what_the_sandbox_was_created_with() {
+        let permissive = {
+            let config = Config::parse_from(["openshell-driver-lxd", "--allow-driver-config"]);
+            let lxd =
+                LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(DEFAULT_LXD_SOCKET))).unwrap();
+            LxdComputeDriver::new(config, lxd)
+        };
+        let strict = driver();
+
+        let recorded = |value: Option<&str>| {
+            let mut instance = lxd_client::Instance {
+                name: "sb".to_string(),
+                description: String::new(),
+                status: "Stopped".to_string(),
+                status_code: 0,
+                architecture: String::new(),
+                ephemeral: false,
+                profiles: Vec::new(),
+                config: HashMap::new(),
+                devices: HashMap::new(),
+                expanded_devices: HashMap::new(),
+                type_: "container".to_string(),
+                project: "default".to_string(),
+            };
+            if let Some(value) = value {
+                instance.config.insert(
+                    mapping::KEY_CALLER_DRIVER_CONFIG.to_string(),
+                    value.to_string(),
+                );
+            }
+            instance
+        };
+
+        // Created without caller config: admissible either way.
+        strict
+            .check_config_provenance(&recorded(Some("false")))
+            .expect("a sandbox created with no caller config is always admissible");
+        permissive
+            .check_config_provenance(&recorded(Some("false")))
+            .expect("a sandbox created with no caller config is always admissible");
+
+        // Created with it: only while the policy still allows it.
+        permissive
+            .check_config_provenance(&recorded(Some("true")))
+            .expect("still allowed");
+        assert!(
+            strict
+                .check_config_provenance(&recorded(Some("true")))
+                .is_err(),
+            "a sandbox created with caller config must not start once it is disabled"
+        );
+
+        // No record at all: fails closed, as upstream's does.
+        assert!(strict.check_config_provenance(&recorded(None)).is_err());
+        assert!(permissive.check_config_provenance(&recorded(None)).is_err());
     }
 
     /// An empty block is what a gateway forwards for a sandbox that named no
