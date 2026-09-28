@@ -79,8 +79,13 @@ PROJECT="${OPENSHELL_TEST_PROJECT:-openshell-test}"
 # Where sandboxes land. Both go on the test project's own default profile,
 # which is where the driver reads them from: it is given nothing but
 # --project, the way an operator points it at a prepared project.
-NETWORK="${OPENSHELL_TEST_NETWORK:-lxdbr0}"
-STORAGE_POOL="${OPENSHELL_TEST_POOL:-default}"
+#
+# Read from the host's own `default` profile rather than assumed. These suites
+# need an OVN network now — a sandbox cannot be fenced anywhere else — and an
+# OVN host is usually a MicroCloud, which has neither an `lxdbr0` nor a pool
+# called `default`. `scripts/setup-ovn-test-env.sh` lays that profile out.
+NETWORK="${OPENSHELL_TEST_NETWORK:-$(lxc profile device get default eth0 network </dev/null 2>/dev/null || true)}"
+STORAGE_POOL="${OPENSHELL_TEST_POOL:-$(lxc profile device get default root pool </dev/null 2>/dev/null || true)}"
 # Driver options the suites do not set themselves, for exercising one of its
 # modes against a whole suite without a second script.
 read -r -a EXTRA_DRIVER_ARGS <<<"${OPENSHELL_TEST_DRIVER_ARGS:-}"
@@ -107,6 +112,15 @@ log() {
 die() {
     printf 'error: %s\n' "$*" >&2
     exit 1
+}
+
+require_layout() {
+    [ -n "$NETWORK" ] || die \
+        "no network to put sandboxes on: the host's default profile has no eth0 NIC." \
+        "Run 'make setup-ovn-test-env', or set OPENSHELL_TEST_NETWORK."
+    [ -n "$STORAGE_POOL" ] || die \
+        "no pool to put sandbox root disks on: the host's default profile has no root disk." \
+        "Run 'make setup-ovn-test-env', or set OPENSHELL_TEST_POOL."
 }
 
 require_tools() {
@@ -415,6 +429,7 @@ ensure_not_running() {
 env_up() {
     require_tools
     ensure_not_running
+    require_layout
     require_ovn_network
     fetch_openshell
     build_driver

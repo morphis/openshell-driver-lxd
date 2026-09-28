@@ -1,4 +1,4 @@
-.PHONY: build release check test test-lxd-client test-driver test-conformance test-upstream-e2e test-rock rock setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean
+.PHONY: build release check test test-lxd-client test-driver test-conformance test-upstream-e2e test-rock rock setup-ovn-test-env setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean
 
 build:
 	cargo build --workspace
@@ -41,6 +41,14 @@ test-conformance:
 # on a cold cache to fetch and build the tests.
 test-upstream-e2e:
 	./scripts/upstream-e2e.sh
+
+# Bootstraps a single-node MicroCloud with OVN, synthesizing the spare disk and
+# spare NIC it wants. Every suite that creates a sandbox needs an OVN network
+# from OpenShell v0.1.0 on: the per-NIC ACL that a sandbox's outer fence is
+# made of is the one thing LXD does not do on a bridge. Needs root; idempotent;
+# `--purge` undoes it.
+setup-ovn-test-env:
+	sudo ./scripts/setup-ovn-test-env.sh
 
 # Provisions LXD for lxd-client's integration tests (see
 # crates/lxd-client/tests/integration.rs). Idempotent; a prerequisite of

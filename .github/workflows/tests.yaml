@@ -14,6 +14,8 @@ permissions:
   contents: read
 
 jobs:
+  # lxd-client knows nothing about sandboxes, so it needs nothing but an
+  # initialized LXD — no OVN, and none of the image tooling below.
   lxd-client-tests:
     runs-on: ubuntu-latest
     steps:
@@ -28,51 +30,59 @@ jobs:
       - name: Run lxd-client tests
         run: make test-lxd-client
 
-  driver-tests:
+  # Everything that creates a sandbox needs an OVN network: from OpenShell
+  # v0.1.0 a sandbox's outer fence is a per-NIC LXD ACL, and LXD applies one
+  # only on OVN. `setup-ovn-test-env` bootstraps a single-node MicroCloud and
+  # synthesizes the spare disk and spare NIC a runner does not have, so these
+  # jobs deliberately do *not* use setup-lxd-action: it would install and
+  # initialize an LXD that MicroCloud then has to work around.
+  sandbox-tests:
+    name: ${{ matrix.suite }}
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [driver, conformance, upstream-e2e]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: canonical/setup-lxd@da2ac84e727dc534215fd14cd088b9209d65893b
-      - name: Install rustup
-        run: sudo snap install --classic rustup
-      - name: Install Rust toolchain
-        run: rustup toolchain install stable --component rustfmt,clippy
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y protobuf-compiler libprotobuf-dev
-      - name: Install image import tools
-        # The driver pulls the upstream OpenShell supervisor image and imports
-        # it into LXD on demand, using skopeo/umoci/mksquashfs. No custom
-        # sandbox image is built.
-        run: sudo apt-get install --no-install-recommends -y skopeo umoci squashfs-tools busybox-static
-      - name: Run driver tests
-        run: make test-driver
 
-  conformance:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Free disk space
-        # Importing the sandbox image needs several GiB of scratch space on
-        # top of LXD's own copy of it.
+        # Converting a sandbox image needs several GiB of scratch space on top
+        # of LXD's own copy of it, and the gateway is built from source.
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-      - uses: canonical/setup-lxd@da2ac84e727dc534215fd14cd088b9209d65893b
-        with:
-          channel: latest/stable
+
       - name: Install rustup
         run: sudo snap install --classic rustup
       - name: Install Rust toolchain
         run: rustup toolchain install stable --component rustfmt,clippy
+
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y protobuf-compiler libprotobuf-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y protobuf-compiler libprotobuf-dev
+
       - name: Install image import tools
-        run: sudo apt-get install --no-install-recommends -y skopeo umoci squashfs-tools
-      - name: Run conformance suite
-        run: make test-conformance
-      - name: Upload conformance artifacts
+        # The driver shells out to all four while converting an OCI image into
+        # an LXD one, and to busybox-static for images missing a shell or `ip`.
+        run: sudo apt-get install --no-install-recommends -y skopeo umoci squashfs-tools xz-utils busybox-static
+
+      - name: Install e2e dependencies
+        if: matrix.suite == 'upstream-e2e'
+        # Rootless podman for the fixture server the forward-proxy L7 tests
+        # start; uidmap and passt are what make it rootless.
+        run: sudo apt-get install --no-install-recommends -y podman uidmap passt
+
+      - name: Bootstrap MicroCloud with OVN
+        run: make setup-ovn-test-env
+
+      - name: Run ${{ matrix.suite }} suite
+        run: make test-${{ matrix.suite }}
+
+      - name: Collect artifacts
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: conformance-artifacts
+          name: ${{ matrix.suite }}-artifacts
           path: target/openshell-test/artifacts
           if-no-files-found: ignore
