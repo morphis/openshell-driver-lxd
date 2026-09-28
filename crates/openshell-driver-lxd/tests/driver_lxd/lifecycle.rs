@@ -655,9 +655,8 @@ async fn explicit_gateway_endpoint_reaches_the_instance() {
 #[tokio::test]
 async fn host_alias_follows_the_gateway_endpoint() {
     for (endpoint, expected) in [
-        ("http://[fd42::5]:17670", Some(vec!["fd42::5"])),
-        ("http://localhost:17670", Some(vec!["127.0.0.1", "::1"])),
-        ("http://gateway.invalid:17670", None),
+        ("http://[fd42::5]:17670", vec!["fd42::5"]),
+        ("http://localhost:17670", vec!["127.0.0.1", "::1"]),
     ] {
         let driver = Driver::start_with(DriverOptions {
             extra_args: vec!["--gateway-endpoint".into(), endpoint.into()],
@@ -695,20 +694,43 @@ async fn host_alias_follows_the_gateway_endpoint() {
                     .to_string()
             });
 
-        match expected {
-            Some(addresses) => assert!(
-                alias.as_deref().is_some_and(|a| addresses.contains(&a)),
-                "{endpoint}: alias {alias:?}, expected one of {addresses:?}; console:\n{log}"
-            ),
-            None => {
-                assert_eq!(alias, None, "{endpoint}: console:\n{log}");
-                assert!(
-                    log.contains("cannot resolve gateway host"),
-                    "{endpoint}: {log}"
-                );
-            }
-        }
+        assert!(
+            alias.as_deref().is_some_and(|a| expected.contains(&a)),
+            "{endpoint}: alias {alias:?}, expected one of {expected:?}; console:\n{log}"
+        );
     }
+}
+
+/// An endpoint that resolves to nothing is refused at create.
+///
+/// The sandbox's egress ACL needs an address to write its gateway rule
+/// against, and that ACL is the outer fence the sandbox cannot run without.
+/// A sandbox created anyway would come up fenced off from the gateway it
+/// exists to talk to, so the driver says so while there is still a request to
+/// fail.
+#[tokio::test]
+async fn an_unresolvable_gateway_endpoint_is_refused() {
+    let driver = Driver::start_with(DriverOptions {
+        extra_args: vec![
+            "--gateway-endpoint".into(),
+            "http://gateway.invalid:17670".into(),
+        ],
+        ..Default::default()
+    })
+    .await;
+    let name = unique_name("badgw");
+    let _cleanup = driver.cleanup(&[&name]);
+
+    let status = driver
+        .create(sandbox(&name))
+        .await
+        .expect_err("a gateway endpoint that resolves to nothing cannot be fenced for");
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status}");
+    assert!(
+        status.message().contains("cannot resolve gateway endpoint"),
+        "{status}"
+    );
+    assert!(lxd().get_instance(&name).await.is_err());
 }
 
 /// With TLS materials sandboxes get an https endpoint and the materials at

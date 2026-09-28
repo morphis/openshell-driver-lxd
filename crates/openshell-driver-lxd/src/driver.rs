@@ -42,6 +42,47 @@ const SETTLE_DELAY: Duration = Duration::from_secs(3);
 /// See [`LxdComputeDriver::confirm_runtime_restart`].
 const RUNTIME_RESTART_SETTLE: Duration = Duration::from_millis(2250);
 
+/// How many times a create is retried through LXD's own ACL setup race.
+///
+/// More than one attempt can lose: the two instances racing can fail at
+/// different points of LXD's NIC attach, and the loser of one can go on to
+/// lose the other.
+const ACL_SETUP_RETRIES: u32 = 8;
+
+/// How long to wait between those attempts. The loser of the race only has to
+/// wait for the winner's OVN transaction, which is quick.
+const ACL_SETUP_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// LXD's own sentences for the two places it sets a NIC's ACLs up in OVN.
+///
+/// Both are reached while attaching the NIC during instance creation, and both
+/// fail when another instance creation is doing the same thing at the same
+/// time — `ovn-nbctl` has been observed rejecting the second transaction and
+/// also aborting outright (`signal: aborted (core dumped)`) on MicroOVN 24.03.
+const ACL_SETUP_FAILURES: &[&str] = &[
+    "Failed ensuring security ACLs are configured in OVN",
+    "Failed applying OVN default ACL rules for instance NIC",
+];
+
+/// Whether `error` is LXD failing to set a NIC's ACLs up in OVN because
+/// another instance creation was doing the same thing.
+///
+/// Matched on the text because that is all LXD gives: the REST API reports it
+/// as a generic operation failure carrying `ovn-nbctl`'s output. Only LXD's
+/// own sentences are matched, not `ovn-nbctl`'s — one race was observed
+/// reported three ways on one host (a uniqueness constraint violation,
+/// "multiple rows in Port_Group match", and a core dump), so keying on the
+/// tail would catch it only sometimes.
+fn is_acl_setup_race(error: &DriverError) -> bool {
+    let DriverError::Lxd(error) = error else {
+        return false;
+    };
+    let message = error.to_string();
+    ACL_SETUP_FAILURES
+        .iter()
+        .any(|failure| message.contains(failure))
+}
+
 /// The two ACLs one sandbox owns.
 ///
 /// `protocol` is carried by both halves and is the whole of what the workload
@@ -1012,18 +1053,29 @@ impl LxdComputeDriver {
         let profiles = mapping::build_profiles(template);
 
         // 1. Create workload instance
-        let op = self
-            .lxd
-            .create_instance(
+        //
+        // A create that fails here has already had the sandbox's two ACLs
+        // made for it, and LXD has been observed to leave the instance record
+        // behind as well (see `create_instance_settling_acl_setup`). Neither
+        // has an owner once this returns, so both are cleaned up before the
+        // error goes back: otherwise the ACLs wait for the six-hourly
+        // collector and the record shows for ever as a sandbox that is
+        // provisioning.
+        if let Err(e) = self
+            .create_instance_settling_acl_setup(
                 &sandbox.name,
                 &image_alias,
                 config,
                 devices,
                 profiles,
-                false,
             )
-            .await?;
-        self.wait_operation(&op.id).await?;
+            .await
+        {
+            self.delete_instance_and_wait(&sandbox.name).await;
+            self.delete_sandbox_acl(&sandbox.name).await;
+            drop(volume_use);
+            return Err(e);
+        }
 
         // Everything from here to the companion's creation runs inside a
         // block whose failure deletes the workload. Without it a create that
@@ -1108,27 +1160,16 @@ impl LxdComputeDriver {
             aux_pool,
             &dhcp_volume_name,
         );
-        let sup_create = self
-            .lxd
-            .create_instance(
+        if let Err(e) = self
+            .create_instance_settling_acl_setup(
                 &sup_name,
                 &supervisor_image_alias,
                 sup_config,
                 sup_devices,
                 vec!["default".to_string()],
-                false,
             )
-            .await;
-
-        let sup_op = match sup_create {
-            Ok(op) => op,
-            Err(e) => {
-                let _ = self.lxd.delete_instance(&sandbox.name).await;
-                drop(volume_use);
-                return Err(e.into());
-            }
-        };
-        if let Err(e) = self.wait_operation(&sup_op.id).await {
+            .await
+        {
             // Only a companion this create actually made: the name may
             // belong to another sandbox, which is exactly why the create
             // could have failed.
@@ -1197,6 +1238,65 @@ impl LxdComputeDriver {
         }
 
         Ok(())
+    }
+
+    /// Creates an instance, retrying while LXD is still setting the sandbox
+    /// network's ACL up in OVN.
+    ///
+    /// The first instance to attach an ACL makes LXD create that ACL's OVN
+    /// port group, and LXD does not serialize it: two sandboxes created at
+    /// once both try, and OVN rejects the second with a constraint violation
+    /// on the port group's name. It is transient by construction — the group
+    /// exists afterwards — and it only became reachable when the egress ACL
+    /// stopped being optional, so every create attaches one now.
+    ///
+    /// Retrying is the driver's to do. A gateway creating two sandboxes at
+    /// once is ordinary, and the alternative is a create that fails for a
+    /// reason the caller can neither understand nor act on.
+    async fn create_instance_settling_acl_setup(
+        &self,
+        name: &str,
+        image_alias: &str,
+        config: HashMap<String, String>,
+        devices: HashMap<String, HashMap<String, String>>,
+        profiles: Vec<String>,
+    ) -> Result<(), DriverError> {
+        let mut attempt = 0;
+        loop {
+            let created = self
+                .lxd
+                .create_instance(
+                    name,
+                    image_alias,
+                    config.clone(),
+                    devices.clone(),
+                    profiles.clone(),
+                    false,
+                )
+                .await;
+            let outcome = match created {
+                Ok(op) => self.wait_operation(&op.id).await,
+                Err(e) => Err(e.into()),
+            };
+            let Err(error) = outcome else {
+                return Ok(());
+            };
+            attempt += 1;
+            if attempt > ACL_SETUP_RETRIES || !is_acl_setup_race(&error) {
+                return Err(error);
+            }
+            tracing::debug!(
+                name = %name,
+                attempt,
+                %error,
+                "LXD raced itself setting the sandbox ACL up in OVN; retrying the create"
+            );
+            // A create leaves no instance behind when it fails this way, but
+            // LXD has been observed to leave the record; remove it so the
+            // retry is not refused as a duplicate.
+            let _ = self.lxd.delete_instance(name).await;
+            tokio::time::sleep(ACL_SETUP_RETRY_DELAY).await;
+        }
     }
 
     async fn instance_lifecycle_lock(&self, name: &str) -> Arc<Mutex<()>> {
@@ -2355,6 +2455,66 @@ mod tests {
                 gpu: Some(GpuResourceRequirements { count }),
             }),
             ..Default::default()
+        }
+    }
+
+    /// The text is all LXD gives for this one: the REST API reports it as a
+    /// generic operation failure carrying `ovn-nbctl`'s output. Recorded
+    /// verbatim from LXD 6.9, so a change in wording fails here rather than
+    /// silently turning the retry off.
+    #[test]
+    fn lxds_own_acl_setup_race_is_recognized() {
+        let observed = DriverError::Lxd(lxd_client::LxdError::OperationFailed {
+            description: "Creating instance".to_string(),
+            err: "Creating instance: Failed creating instance record: Failed initialising \
+                  instance: Failed adding device \"eth0\": Failed adding OVN port: Failed \
+                  ensuring security ACLs are configured in OVN for instance: Failed creating \
+                  port group \"lxd_acl0\" for referenced security ACL \"127.0.0.1\" setup: \
+                  Failed running: ovn-nbctl ... transaction error: {\"details\":\"Transaction \
+                  causes multiple rows in \\\"Port_Group\\\" table to have identical values \
+                  (lxd_acl0) for index on column \\\"name\\\".\",\"error\":\"constraint \
+                  violation\"}"
+                .to_string(),
+        });
+        assert!(is_acl_setup_race(&observed));
+
+        // The same contention, at the other point LXD sets a NIC's ACLs up —
+        // where `ovn-nbctl` was seen to abort rather than refuse.
+        let aborted = DriverError::Lxd(lxd_client::LxdError::OperationFailed {
+            description: "Creating instance".to_string(),
+            err: "Creating instance: Failed creating instance record: Failed initialising \
+                  instance: Failed adding device \"eth0\": Failed adding OVN port: Failed \
+                  applying OVN default ACL rules for instance NIC: Failed applying instance \
+                  NIC default ACL rules for port \"lxd-net2-instance-...-eth0\": Failed \
+                  running: ovn-nbctl ... : signal: aborted (core dumped)"
+                .to_string(),
+        });
+        assert!(is_acl_setup_race(&aborted));
+
+        // The same race, reported the other way LXD 6.9 was seen to report it.
+        let also_observed = DriverError::Lxd(lxd_client::LxdError::OperationFailed {
+            description: "Creating instance".to_string(),
+            err: "Creating instance: Failed creating instance record: Failed initialising \
+                  instance: Failed adding device \"eth0\": Failed adding OVN port: Failed \
+                  ensuring security ACLs are configured in OVN for instance: Failed creating \
+                  port group \"lxd_acl0\" for referenced security ACL \"127.0.0.1\" setup: \
+                  Failed running: ovn-nbctl ... exit status 1 (ovn-nbctl: multiple rows in \
+                  Port_Group match \"lxd_acl0\")"
+                .to_string(),
+        });
+        assert!(is_acl_setup_race(&also_observed));
+
+        // Anything else is a real failure and must not be retried.
+        for other in [
+            DriverError::Lxd(lxd_client::LxdError::OperationFailed {
+                description: "Creating instance".to_string(),
+                err: "Failed creating instance record: Failed getting root disk: No root disk \
+                      device found"
+                    .to_string(),
+            }),
+            DriverError::InvalidArgument("nope".to_string()),
+        ] {
+            assert!(!is_acl_setup_race(&other), "{other:?}");
         }
     }
 
