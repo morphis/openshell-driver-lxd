@@ -404,7 +404,9 @@ impl Driver {
         let deadline = Instant::now() + timeout;
         loop {
             if let Ok(mut client) = self.try_client().await {
-                let call = client.get_capabilities(Request::new(GetCapabilitiesRequest {}));
+                let call = client.get_capabilities(Request::new(GetCapabilitiesRequest {
+                    gateway: Some(openshell_driver_lxd::protocol::gateway_metadata()),
+                }));
                 if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(2), call).await {
                     return;
                 }
@@ -525,7 +527,7 @@ impl Driver {
             .await
             .get_sandbox(Request::new(GetSandboxRequest {
                 sandbox_id: id.to_string(),
-                sandbox_name: name.to_string(),
+                name: name.to_string(),
             }))
             .await
             .map(|r| {
@@ -562,7 +564,7 @@ impl Driver {
             .await
             .stop_sandbox(Request::new(StopSandboxRequest {
                 sandbox_id: id.to_string(),
-                sandbox_name: name.to_string(),
+                name: name.to_string(),
             }))
             .await
             .map(|_| ())
@@ -573,7 +575,13 @@ impl Driver {
             .await
             .start_sandbox(Request::new(StartSandboxRequest {
                 sandbox_id: String::new(),
-                sandbox_name: name.to_string(),
+                name: name.to_string(),
+                // A gateway sends fresh launch credentials and a new
+                // generation on every start; the driver's own start path is
+                // what these tests exercise, so they send none.
+                launch_authentication: Vec::new(),
+                generation_id: String::new(),
+                expected_runtime_identity: String::new(),
             }))
             .await
             .map(|_| ())
@@ -588,7 +596,7 @@ impl Driver {
             .await
             .delete_sandbox(Request::new(DeleteSandboxRequest {
                 sandbox_id: id.to_string(),
-                sandbox_name: name.to_string(),
+                name: name.to_string(),
             }))
             .await
             .map(|r| r.into_inner().deleted)

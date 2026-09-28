@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::net::SocketAddr;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+
+use crate::admission::ResourceAdmissionConfig;
 
 /// Default path for the gRPC Unix domain socket the OpenShell gateway
 /// connects to.
@@ -285,18 +287,33 @@ pub struct Config {
     #[arg(long, value_parser = parse_gateway_endpoint)]
     pub gateway_endpoint: Option<String>,
 
-    /// Address the gateway should additionally listen on for sandbox
-    /// callbacks, e.g. `169.254.17.1:17670`. The driver hands it to the
-    /// gateway as a listener requirement, and the gateway binds it accepting
-    /// only the methods a sandbox may call. It filters by method, not by
-    /// caller: a client certificate the gateway trusts is still a user there
-    /// for the methods users may call too (OpenShell v0.0.116:
-    /// `GetSandboxConfig`, `UpdateConfig`, `GetDraftPolicy`). The port must be
-    /// the gateway's own port and the address one its main listener does not
-    /// already cover. Point --gateway-endpoint at it, directly or through
-    /// forwarding.
-    #[arg(long, value_parser = parse_callback_listener)]
-    pub gateway_callback_listener: Option<SocketAddr>,
+    /// Accept caller-supplied `template.driver_config` (`network`,
+    /// `storage_pool`, `max_processes`, `profiles`).
+    ///
+    /// Off by default, matching the gateway's own default. Both sides must
+    /// agree: the gateway compares its configured admission policy with the
+    /// one this driver reports, and refuses to provision through it at all
+    /// when they differ. Set `allow_driver_config = true` under
+    /// `[openshell.drivers.<name>]` in the gateway's configuration and pass
+    /// this flag here.
+    #[arg(long)]
+    pub allow_driver_config: bool,
+
+    /// A label an external resource must carry before a sandbox may attach
+    /// it, as `key=value`. Repeatable; any use of this option replaces the
+    /// default label set rather than adding to it. `${value}` of
+    /// `${workspace}` matches the sandbox's workspace.
+    ///
+    /// LXD sandboxes attach no such resources today — a root disk and a NIC
+    /// come from the project's profile — so this exists to match a gateway
+    /// configured with a non-default policy, not to gate anything here.
+    #[arg(long = "resource-admission-label", value_name = "KEY=VALUE", value_parser = parse_label)]
+    pub resource_admission_labels: Vec<(String, String)>,
+
+    /// Acknowledge a gateway configured with `resource_admission.enabled =
+    /// false`. Without a matching gateway this only makes the policies differ.
+    #[arg(long, conflicts_with = "resource_admission_labels")]
+    pub no_resource_admission: bool,
 
     /// Set `security.nesting` on sandboxes, for workloads that run containers
     /// themselves. The supervisor does not need it: its network namespace,
@@ -381,11 +398,32 @@ impl Config {
         }
     }
 
+    /// The external-resource admission policy half of what this driver
+    /// acknowledges to the gateway.
+    #[must_use]
+    pub fn resource_admission(&self) -> ResourceAdmissionConfig {
+        if self.no_resource_admission {
+            return ResourceAdmissionConfig {
+                enabled: false,
+                required_labels: BTreeMap::new(),
+            };
+        }
+        if self.resource_admission_labels.is_empty() {
+            return ResourceAdmissionConfig::default();
+        }
+        ResourceAdmissionConfig {
+            enabled: true,
+            required_labels: self.resource_admission_labels.iter().cloned().collect(),
+        }
+    }
+
     /// Checks that sandboxes will reach the gateway over TLS, or that
     /// plaintext was explicitly allowed, and that `--gateway-endpoint`
-    /// agrees. clap enforces the rest (all three TLS files or none, and not
-    /// alongside `--allow-plaintext-gateway`).
+    /// agrees; and that the admission policy is one a gateway would accept.
+    /// clap enforces the rest (all three TLS files or none, and not alongside
+    /// `--allow-plaintext-gateway`).
     pub fn validate(&self) -> Result<(), String> {
+        self.resource_admission().validate()?;
         let tls = self.guest_tls().is_some();
         if !tls && !self.allow_plaintext_gateway {
             return Err(
@@ -416,6 +454,17 @@ impl Config {
     }
 }
 
+/// Validates `--resource-admission-label`: a non-empty `key=value` pair.
+fn parse_label(value: &str) -> Result<(String, String), String> {
+    let (key, label_value) = value
+        .split_once('=')
+        .ok_or_else(|| "not a key=value pair".to_string())?;
+    if key.is_empty() || label_value.is_empty() {
+        return Err("neither the key nor the value may be empty".to_string());
+    }
+    Ok((key.to_string(), label_value.to_string()))
+}
+
 /// Validates `--gateway-tls-server-name`: an IP address or a DNS name.
 fn parse_tls_server_name(value: &str) -> Result<String, String> {
     if value.parse::<std::net::IpAddr>().is_ok() {
@@ -435,21 +484,6 @@ fn parse_tls_server_name(value: &str) -> Result<String, String> {
     } else {
         Err(format!("{value:?} is not a DNS name or an IP address"))
     }
-}
-
-/// Validates `--gateway-callback-listener`: a concrete address and port, which
-/// is all the gateway accepts for a driver-requested listener.
-fn parse_callback_listener(value: &str) -> Result<SocketAddr, String> {
-    let address: SocketAddr = value
-        .parse()
-        .map_err(|e| format!("not an IP:port address: {e}"))?;
-    if address.ip().is_unspecified() || address.ip().is_multicast() {
-        return Err(format!("{} is not a single unicast address", address.ip()));
-    }
-    if address.port() == 0 {
-        return Err("the port must not be 0".to_string());
-    }
-    Ok(address)
 }
 
 /// Validates `--gateway-endpoint`: an `http` or `https` URL naming a host and
@@ -690,26 +724,6 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(plaintext_http.validate(), Ok(()));
-    }
-
-    #[test]
-    fn callback_listener_is_a_concrete_address() {
-        let config = parse(&["--gateway-callback-listener", "169.254.17.1:17670"]).unwrap();
-        assert_eq!(
-            config.gateway_callback_listener,
-            Some("169.254.17.1:17670".parse().unwrap())
-        );
-        for value in [
-            "0.0.0.0:17670",
-            "169.254.17.1",
-            "169.254.17.1:0",
-            "[ff02::1]:17670",
-        ] {
-            assert!(
-                parse(&["--gateway-callback-listener", value]).is_err(),
-                "{value} should be rejected"
-            );
-        }
     }
 
     #[test]

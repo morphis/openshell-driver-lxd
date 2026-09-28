@@ -979,6 +979,7 @@ dependencies = [
  "lxd-client",
  "prost-types",
  "regex",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

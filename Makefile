@@ -82,14 +82,17 @@ proto:
 	cargo build -p computev1
 
 # Proto files vendored from upstream NVIDIA/OpenShell. compute_driver.proto is
-# the driver contract itself; options.proto defines the custom field and method
-# options it imports (e.g. the `secret` field option on sandbox_token) and must
-# be resolvable on protoc's include path for codegen to succeed.
-UPSTREAM_PROTOS := compute_driver.proto options.proto
+# the driver contract itself; the rest are the files it imports, directly or
+# not, and must be resolvable on protoc's include path for codegen to succeed:
+# options.proto defines the custom field and method options (e.g. the `secret`
+# field option on launch_authentication), extension.proto the protocol metadata
+# the gateway negotiates with, and sandbox.proto the effective policy handed to
+# the driver, which in turn imports datamodel.proto.
+UPSTREAM_PROTOS := compute_driver.proto options.proto extension.proto sandbox.proto datamodel.proto
 
 # OpenShell release the vendored protos are taken from: the newest release the
 # driver targets.
-OPENSHELL_REF ?= v0.1.0-pre.1
+OPENSHELL_REF ?= v0.1.0-pre.11
 
 # Sync proto/ with upstream NVIDIA/OpenShell at $(OPENSHELL_REF).
 sync-proto:

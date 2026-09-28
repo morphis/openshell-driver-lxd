@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+pub mod admission;
 pub mod config;
 pub(crate) mod dhcp_client;
 pub mod driver;
@@ -9,4 +10,5 @@ pub(crate) mod gc;
 pub mod grpc;
 pub mod image;
 pub(crate) mod mapping;
+pub mod protocol;
 pub(crate) mod watcher;

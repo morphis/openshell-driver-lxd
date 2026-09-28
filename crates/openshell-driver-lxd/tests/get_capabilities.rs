@@ -20,7 +20,9 @@ async fn get_capabilities_returns_driver_info() {
     let service = ComputeDriverService::without_watcher(LxdComputeDriver::new(config, lxd));
 
     let response = service
-        .get_capabilities(Request::new(GetCapabilitiesRequest {}))
+        .get_capabilities(Request::new(GetCapabilitiesRequest {
+            gateway: Some(openshell_driver_lxd::protocol::gateway_metadata()),
+        }))
         .await
         .expect("get_capabilities should succeed")
         .into_inner();

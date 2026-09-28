@@ -11,12 +11,11 @@ use computev1::pb::{
     watch_sandboxes_event, AuthenticateSandboxRequest, AuthenticateSandboxResponse,
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse,
-    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
-    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
-    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
-    WatchSandboxesEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
+    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
+    GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
+    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
+    WatchSandboxesRequest, WatchSandboxesSandboxEvent,
 };
 use futures::Stream;
 use tokio::sync::broadcast;
@@ -60,24 +59,23 @@ impl ComputeDriverService {
     }
 }
 
-/// Resolves the instance name a request should act on. Prefers
-/// `sandbox_name` (the common case); when it's empty, falls back to
+/// Resolves the instance name a request should act on. Prefers the
+/// compute-runtime `name` (the common case); when it's empty, falls back to
 /// looking up the instance whose `user.openshell.sandbox_id` config key
 /// matches `sandbox_id` — both fields exist on these requests precisely so
 /// callers can address a sandbox by either.
 async fn resolve_name(
     driver: &LxdComputeDriver,
-    sandbox_name: &str,
+    name: &str,
     sandbox_id: &str,
 ) -> Result<String, Status> {
-    if !sandbox_name.is_empty() {
-        return Ok(sandbox_name.to_string());
+    if !name.is_empty() {
+        return Ok(name.to_string());
     }
     if sandbox_id.is_empty() {
-        return Err(DriverError::InvalidArgument(
-            "sandbox_name or sandbox_id is required".to_string(),
-        )
-        .into());
+        return Err(
+            DriverError::InvalidArgument("name or sandbox_id is required".to_string()).into(),
+        );
     }
     driver
         .find_name_by_sandbox_id(sandbox_id)
@@ -89,11 +87,23 @@ async fn resolve_name(
 
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
+    /// Reports what this driver can do, after checking that the gateway on
+    /// the other end speaks a protocol it can interoperate with.
+    ///
+    /// The check is mutual by design: the gateway refuses a driver whose
+    /// `extension` metadata it cannot negotiate, and the contract asks the
+    /// driver to refuse a gateway the same way rather than provision against
+    /// a peer whose requirements it does not meet.
     async fn get_capabilities(
         &self,
-        _request: Request<GetCapabilitiesRequest>,
+        request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
-        Ok(Response::new(self.driver.capabilities()))
+        let capabilities = self.driver.capabilities();
+        crate::protocol::negotiate_with_gateway(
+            capabilities.extension.as_ref(),
+            request.into_inner().gateway.as_ref(),
+        )?;
+        Ok(Response::new(capabilities))
     }
 
     /// The driver delivers each sandbox its gateway-minted token itself, so
@@ -112,30 +122,19 @@ impl ComputeDriver for ComputeDriverService {
         )
     }
 
-    /// Asks the gateway for a sandbox-callback listener when one is
-    /// configured (`--gateway-callback-listener`); otherwise sandboxes use the
-    /// gateway's main listener and nothing extra is needed.
-    ///
-    /// Answering rather than leaving the RPC unimplemented matters: the
-    /// gateway calls it at startup and aborts on any error other than
-    /// `Unimplemented`.
-    async fn get_gateway_listener_requirements(
-        &self,
-        _request: Request<GetGatewayListenerRequirementsRequest>,
-    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
-        Ok(Response::new(GetGatewayListenerRequirementsResponse {
-            requirements: self.driver.gateway_listener_requirements(),
-        }))
-    }
-
     async fn start_sandbox(
         &self,
         request: Request<StartSandboxRequest>,
     ) -> Result<Response<StartSandboxResponse>, Status> {
         let req = request.into_inner();
-        let name = resolve_name(&self.driver, &req.sandbox_name, &req.sandbox_id).await?;
+        let name = resolve_name(&self.driver, &req.name, &req.sandbox_id).await?;
         self.driver.start_sandbox(&name).await?;
-        Ok(Response::new(StartSandboxResponse {}))
+        // Empty, as capabilities say: `supports_sandbox_authentication` is
+        // false, and the gateway only binds a runtime identity for drivers
+        // that advertise it.
+        Ok(Response::new(StartSandboxResponse {
+            runtime_identity: String::new(),
+        }))
     }
 
     /// Workspaces own no LXD resources of their own: every sandbox lives in
@@ -173,7 +172,7 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
         let req = request.into_inner();
-        let name = resolve_name(&self.driver, &req.sandbox_name, &req.sandbox_id).await?;
+        let name = resolve_name(&self.driver, &req.name, &req.sandbox_id).await?;
         let sandbox = self.driver.get_sandbox(&name).await?;
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
@@ -198,7 +197,10 @@ impl ComputeDriver for ComputeDriverService {
             ))
         })?;
         self.driver.create_sandbox(&sandbox).await?;
-        Ok(Response::new(CreateSandboxResponse {}))
+        // See `start_sandbox`: no runtime identity to bind.
+        Ok(Response::new(CreateSandboxResponse {
+            runtime_identity: String::new(),
+        }))
     }
 
     async fn stop_sandbox(
@@ -206,7 +208,7 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
         let req = request.into_inner();
-        let name = resolve_name(&self.driver, &req.sandbox_name, &req.sandbox_id).await?;
+        let name = resolve_name(&self.driver, &req.name, &req.sandbox_id).await?;
         self.driver.stop_sandbox(&name).await?;
         Ok(Response::new(StopSandboxResponse {}))
     }
@@ -216,7 +218,7 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let req = request.into_inner();
-        let name = match resolve_name(&self.driver, &req.sandbox_name, &req.sandbox_id).await {
+        let name = match resolve_name(&self.driver, &req.name, &req.sandbox_id).await {
             Ok(name) => name,
             // No instance carries this id, so there is nothing to delete —
             // the same answer an unknown name gets. Delete must be idempotent
@@ -411,45 +413,77 @@ mod tests {
             .expect("watch stream should not end")
     }
 
-    /// The gateway calls this at startup and aborts on any error but
-    /// `Unimplemented`; without a callback listener the driver needs none.
+    /// A gateway too old to negotiate sends no metadata at all. Refusing it
+    /// here is what keeps the mismatch from becoming a sandbox that never
+    /// starts.
     #[tokio::test]
-    async fn gateway_listener_requirements_are_empty_by_default() {
-        let response = service()
-            .get_gateway_listener_requirements(Request::new(
-                GetGatewayListenerRequirementsRequest {},
-            ))
+    async fn capabilities_refuse_a_gateway_that_sends_no_protocol_metadata() {
+        let status = service()
+            .get_capabilities(Request::new(GetCapabilitiesRequest { gateway: None }))
             .await
-            .expect("listener requirements should be answered")
-            .into_inner();
-        assert!(response.requirements.is_empty());
+            .expect_err("a gateway without protocol metadata should be refused");
+        assert_eq!(status.code(), Code::FailedPrecondition);
     }
 
     #[tokio::test]
-    async fn gateway_listener_requirements_carry_the_callback_listener() {
-        use computev1::pb::gateway_listener_requirement::Selector;
-
-        let config = Config::parse_from([
-            "openshell-driver-lxd",
-            "--gateway-callback-listener",
-            "169.254.17.1:17670",
-        ]);
-        let lxd =
-            LxdClient::new(LxdEndpoint::UnixSocket("/nonexistent/lxd.socket".into())).unwrap();
-        let response = ComputeDriverService::without_watcher(LxdComputeDriver::new(config, lxd))
-            .get_gateway_listener_requirements(Request::new(
-                GetGatewayListenerRequirementsRequest {},
-            ))
+    async fn capabilities_refuse_an_incompatible_protocol_major() {
+        let mut gateway = crate::protocol::gateway_metadata();
+        gateway.protocol_version =
+            Some(computev1::extensionv1::ProtocolVersion { major: 2, minor: 0 });
+        let status = service()
+            .get_capabilities(Request::new(GetCapabilitiesRequest {
+                gateway: Some(gateway),
+            }))
             .await
-            .expect("listener requirements should be answered")
-            .into_inner();
+            .expect_err("protocol 2.x should be refused");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+    }
 
-        assert_eq!(response.requirements.len(), 1);
+    /// A newer minor version only ever adds optional fields, so it stays
+    /// compatible as long as the required capabilities are met.
+    #[tokio::test]
+    async fn capabilities_accept_a_newer_protocol_minor() {
+        let mut gateway = crate::protocol::gateway_metadata();
+        gateway.protocol_version =
+            Some(computev1::extensionv1::ProtocolVersion { major: 1, minor: 7 });
+        service()
+            .get_capabilities(Request::new(GetCapabilitiesRequest {
+                gateway: Some(gateway),
+            }))
+            .await
+            .expect("protocol 1.7 should be accepted");
+    }
+
+    #[tokio::test]
+    async fn capabilities_refuse_a_gateway_requiring_an_unknown_capability() {
+        let mut gateway = crate::protocol::gateway_metadata();
+        gateway
+            .required_capabilities
+            .push("openshell.compute.something-new".to_string());
+        let status = service()
+            .get_capabilities(Request::new(GetCapabilitiesRequest {
+                gateway: Some(gateway),
+            }))
+            .await
+            .expect_err("an unmet gateway requirement should be refused");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+    }
+
+    /// The acknowledgement is compared byte for byte by the gateway, so the
+    /// exact string matters more than the policy it encodes.
+    #[tokio::test]
+    async fn capabilities_acknowledge_the_default_admission_policy() {
+        let capabilities = service()
+            .get_capabilities(Request::new(GetCapabilitiesRequest {
+                gateway: Some(crate::protocol::gateway_metadata()),
+            }))
+            .await
+            .expect("capabilities")
+            .into_inner();
         assert_eq!(
-            response.requirements[0].selector,
-            Some(Selector::ExactBindAddress("169.254.17.1:17670".to_string()))
+            capabilities.resource_admission_policy,
+            crate::admission::DriverAdmissionConfig::default().acknowledgement()
         );
-        assert!(!response.requirements[0].reason.is_empty());
     }
 
     #[tokio::test]
@@ -464,7 +498,9 @@ mod tests {
         assert_eq!(status.code(), Code::Unimplemented);
 
         let capabilities = service
-            .get_capabilities(Request::new(GetCapabilitiesRequest {}))
+            .get_capabilities(Request::new(GetCapabilitiesRequest {
+                gateway: Some(crate::protocol::gateway_metadata()),
+            }))
             .await
             .expect("capabilities")
             .into_inner();

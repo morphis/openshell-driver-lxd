@@ -17,7 +17,9 @@ async fn capabilities_are_served_over_the_socket() {
     let response = driver
         .client()
         .await
-        .get_capabilities(Request::new(GetCapabilitiesRequest {}))
+        .get_capabilities(Request::new(GetCapabilitiesRequest {
+            gateway: Some(openshell_driver_lxd::protocol::gateway_metadata()),
+        }))
         .await
         .expect("get_capabilities")
         .into_inner();

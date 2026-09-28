@@ -177,12 +177,17 @@ fn to_driver_sandbox(instance: &Instance, stop_seen: StopSeen) -> DriverSandbox 
             .unwrap_or_default(),
         spec: None,
         status: Some(DriverSandboxStatus {
-            sandbox_name: instance.name.clone(),
+            name: instance.name.clone(),
             instance_id: instance.name.clone(),
             agent_fd: String::new(),
             sandbox_fd: String::new(),
             conditions: vec![ready_condition(instance, stop_seen)],
             deleting: false,
+            // Both are declared by the v0.1.0-pre.11 contract but not read by
+            // the gateway yet: it takes the workload identity and the fence
+            // from the supervisor's own attach, not from this snapshot.
+            resolved_identity: None,
+            fence_evidence: None,
         }),
     }
 }
@@ -316,7 +321,11 @@ fn ready_condition(instance: &Instance, stop_seen: StopSeen) -> DriverCondition 
         status: status.to_string(),
         reason: reason.to_string(),
         message,
-        last_transition_time: String::new(),
+        // Left unset, as it was when this was a string: LXD records when an
+        // instance last changed state, not when this derived Ready condition
+        // did, and reporting the one as the other would date every condition
+        // to the sandbox's last start.
+        transition_time: None,
     }
 }
 
@@ -1159,7 +1168,7 @@ mod tests {
         assert!(sandbox.spec.is_none(), "observed snapshots omit spec");
 
         let status = sandbox.status.expect("status is always reported");
-        assert_eq!(status.sandbox_name, "sb-name");
+        assert_eq!(status.name, "sb-name");
         assert_eq!(status.instance_id, "sb-name");
         assert!(!status.deleting);
         assert_eq!(status.conditions.len(), 1);

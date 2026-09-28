@@ -7,17 +7,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use computev1::pb::{
-    gateway_listener_requirement, DriverSandbox, GatewayListenerRequirement,
-    GetCapabilitiesResponse,
+    CpuResourceCapabilities, DriverSandbox, GetCapabilitiesResponse, GpuResourceCapabilities,
+    MemoryResourceCapabilities, ResourceCapabilities,
 };
 use lxd_client::{LxdClient, LxdError, NetworkType};
 use tokio::sync::{Mutex, OnceCell, RwLock};
 
+use crate::admission::DriverAdmissionConfig;
 use crate::config::Config;
 use crate::dhcp_client;
 use crate::error::DriverError;
 use crate::image::{self, digest_of_file, ImageCache, SkopeoImporter};
 use crate::mapping;
+use crate::protocol;
 
 const DRIVER_NAME: &str = "lxd";
 
@@ -305,28 +307,13 @@ impl LxdComputeDriver {
         self.lxd.clone()
     }
 
-    /// Listeners the gateway should bind besides its main one: the
-    /// sandbox-callback listener, when configured.
-    #[must_use]
-    pub fn gateway_listener_requirements(&self) -> Vec<GatewayListenerRequirement> {
-        self.config
-            .gateway_callback_listener
-            .map(|address| GatewayListenerRequirement {
-                reason: "sandboxes reach the gateway here; serve sandbox-callable RPCs only"
-                    .to_string(),
-                selector: Some(gateway_listener_requirement::Selector::ExactBindAddress(
-                    address.to_string(),
-                )),
-            })
-            .into_iter()
-            .collect()
-    }
-
     /// Report driver capabilities and defaults.
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
         GetCapabilitiesResponse {
             driver_name: DRIVER_NAME.to_string(),
+            // Kept for diagnostics only; the gateway reads the version from
+            // `extension` below.
             driver_version: env!("CARGO_PKG_VERSION").to_string(),
             default_image: self.config.default_image.clone(),
             // The gateway would stop every sandbox when it shuts down and
@@ -334,9 +321,47 @@ impl LxdComputeDriver {
             // across gateway restarts instead; StartSandbox is only for
             // sandboxes that were stopped.
             gateway_manages_lifecycle: false,
-            // Sandboxes get their gateway token from the driver; there is no
-            // platform credential for AuthenticateSandbox to verify.
+            // Sandboxes get their gateway credentials from the driver; there
+            // is no platform credential for AuthenticateSandbox to verify, so
+            // there is no runtime identity for the gateway to bind either.
             supports_sandbox_authentication: false,
+            // The sandbox's own supervisor session is what readiness means
+            // here, as for every driver that runs the standard supervisor.
+            driver_reports_runtime_readiness: false,
+            resource_capabilities: Some(ResourceCapabilities {
+                cpu: Some(CpuResourceCapabilities {
+                    limit_supported: true,
+                }),
+                memory: Some(MemoryResourceCapabilities {
+                    limit_supported: true,
+                }),
+                gpu: Some(GpuResourceCapabilities {
+                    // A GPU request attaches the host's GPUs through an LXD
+                    // `gputype: physical` device.
+                    default_selection_supported: true,
+                    // Honoring a count needs host GPU inventory the driver
+                    // does not collect; see `create_sandbox`.
+                    count_selection_supported: false,
+                }),
+            }),
+            // The driver takes images from a registry, not from a rootfs tar
+            // staged by the gateway. Zero tells the gateway not to offer one.
+            rootfs_tar_staging_dir: String::new(),
+            rootfs_tar_max_bytes: 0,
+            extension: Some(protocol::driver_metadata()),
+            // Byte-for-byte what the gateway computes from its own
+            // `[openshell.drivers.<name>]` configuration, or it refuses to
+            // provision through this driver at all. See `crate::admission`.
+            resource_admission_policy: self.admission_policy().acknowledgement(),
+        }
+    }
+
+    /// The admission policy this driver enforces and acknowledges.
+    #[must_use]
+    pub fn admission_policy(&self) -> DriverAdmissionConfig {
+        DriverAdmissionConfig {
+            allow_driver_config: self.config.allow_driver_config,
+            resource_admission: self.config.resource_admission(),
         }
     }
 
@@ -361,6 +386,23 @@ impl LxdComputeDriver {
         let template = spec.template.as_ref().ok_or_else(|| {
             DriverError::InvalidArgument("sandbox.spec.template is required".into())
         })?;
+
+        // The gateway rejects caller driver config before it gets here when
+        // the policy forbids it, but a driver socket has other callers, and
+        // the policy this driver acknowledged is the one it must enforce.
+        if !self.config.allow_driver_config
+            && template
+                .driver_config
+                .as_ref()
+                .is_some_and(|config| !config.fields.is_empty())
+        {
+            return Err(DriverError::FailedPrecondition(
+                "caller driver config is disabled; start the driver with \
+                 --allow-driver-config and set allow_driver_config = true for this driver in \
+                 the gateway's configuration"
+                    .into(),
+            ));
+        }
 
         // An empty image means the default image, which is validated when it
         // is resolved.
@@ -1265,6 +1307,84 @@ mod tests {
             .validate_sandbox_create(&sandbox)
             .await
             .expect("gpu.count >= 1 should be accepted");
+    }
+
+    fn spec_with_driver_config(fields: &[(&str, &str)]) -> DriverSandboxSpec {
+        let fields = fields
+            .iter()
+            .map(|(key, value)| {
+                (
+                    (*key).to_string(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue((*value).to_string())),
+                    },
+                )
+            })
+            .collect();
+        DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(prost_types::Struct { fields }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The gateway's default policy forbids caller driver config, and the
+    /// driver acknowledges that policy, so it has to refuse one too — a
+    /// gateway is not the only thing that can reach the driver's socket.
+    #[tokio::test]
+    async fn validate_sandbox_create_rejects_caller_driver_config_by_default() {
+        let sandbox = sandbox_with_spec(spec_with_driver_config(&[("storage_pool", "remote")]));
+
+        let error = driver()
+            .validate_sandbox_create(&sandbox)
+            .await
+            .expect_err("caller driver config should be refused by default");
+        assert!(
+            matches!(error, DriverError::FailedPrecondition(_)),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_sandbox_create_accepts_caller_driver_config_when_allowed() {
+        let config = Config::parse_from(["openshell-driver-lxd", "--allow-driver-config"]);
+        let lxd =
+            LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(DEFAULT_LXD_SOCKET))).unwrap();
+        let sandbox = sandbox_with_spec(spec_with_driver_config(&[("storage_pool", "remote")]));
+
+        LxdComputeDriver::new(config, lxd)
+            .validate_sandbox_create(&sandbox)
+            .await
+            .expect("caller driver config should be accepted when allowed");
+    }
+
+    /// An empty block is what a gateway forwards for a sandbox that named no
+    /// driver config at all; refusing it would refuse every sandbox.
+    #[tokio::test]
+    async fn validate_sandbox_create_accepts_an_empty_driver_config() {
+        let sandbox = sandbox_with_spec(spec_with_driver_config(&[]));
+
+        driver()
+            .validate_sandbox_create(&sandbox)
+            .await
+            .expect("an empty driver config is not caller configuration");
+    }
+
+    /// Allowing caller driver config changes what the gateway must be
+    /// configured with, so it has to change the acknowledgement too.
+    #[test]
+    fn allowing_driver_config_changes_the_acknowledged_policy() {
+        let config = Config::parse_from(["openshell-driver-lxd", "--allow-driver-config"]);
+        let lxd =
+            LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(DEFAULT_LXD_SOCKET))).unwrap();
+        let permissive = LxdComputeDriver::new(config, lxd).capabilities();
+
+        assert_ne!(
+            permissive.resource_admission_policy,
+            driver().capabilities().resource_admission_policy
+        );
     }
 
     #[tokio::test]
