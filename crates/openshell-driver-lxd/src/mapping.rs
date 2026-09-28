@@ -712,13 +712,21 @@ fn sandbox_nic(network: &str, egress_acl: Option<&str>) -> HashMap<String, Strin
 /// sandbox's is what lets an operator see it at all — the companion is hidden
 /// from every other driver query.
 ///
-/// It only ever *downgrades*. A companion that is running says nothing the
-/// workload has not already said.
+/// It only ever *downgrades*, and never over a workload that is already
+/// saying why it is not running: that reason is the specific one, and it
+/// carries the console log that explains it, while the companion's is the
+/// same event seen one step removed.
 pub fn aggregate_companion_status(sandbox: &mut DriverSandbox, companion: Option<&Instance>) {
     let Some(status) = sandbox.status.as_mut() else {
         return;
     };
-    let ready = status.conditions.iter().any(|c| c.status == "True");
+    if workload_explains_itself(status) {
+        return;
+    }
+    let ready = status
+        .conditions
+        .iter()
+        .any(|c| c.r#type == "Ready" && c.status == "True");
     let downgrade = |reason: &str, message: String| DriverCondition {
         r#type: "Ready".to_string(),
         status: "False".to_string(),
@@ -741,6 +749,9 @@ pub fn aggregate_companion_status(sandbox: &mut DriverSandbox, companion: Option
     };
 
     if companion.status.eq_ignore_ascii_case("Error") {
+        if !ready {
+            return;
+        }
         status.conditions = vec![downgrade(
             "ContainerError",
             format!(
@@ -757,13 +768,18 @@ pub fn aggregate_companion_status(sandbox: &mut DriverSandbox, companion: Option
                 )];
             }
         } else if companion.config.contains_key(KEY_STOP_INTENT) {
+            // A *running* workload whose companion is deliberately stopped is
+            // a sandbox being started: the driver starts the workload first,
+            // waits for its address, and only then starts the companion. That
+            // is transient, not a stop — reporting it as one would tell the
+            // gateway a sandbox it just started is down.
             if ready {
                 status.conditions = vec![downgrade(
-                    CONDITION_STOPPED,
-                    "supervisor companion was stopped through the compute driver API".to_string(),
+                    CONDITION_STARTING,
+                    "supervisor companion has not been started yet".to_string(),
                 )];
             }
-        } else {
+        } else if ready {
             status.conditions = vec![downgrade(
                 CONDITION_EXITED,
                 "supervisor companion stopped unexpectedly".to_string(),
@@ -775,6 +791,30 @@ pub fn aggregate_companion_status(sandbox: &mut DriverSandbox, companion: Option
             format!("supervisor companion is not ready: {}", companion.status),
         )];
     }
+}
+
+/// Whether the workload is already reporting why it is not running.
+///
+/// The companion usually goes down with the workload it supervises, so
+/// without this the common case — a workload whose init exited, taking its
+/// companion with it — reported "supervisor companion stopped unexpectedly"
+/// and threw away the workload's own reason along with the console log that
+/// came with it. A deliberate stop whose companion marker failed to write
+/// went further and turned a recoverable `ContainerStopped` into a terminal
+/// `ContainerExited`.
+///
+/// Transient reasons are not this: a sandbox that is merely starting, or
+/// created and not yet started, is not explaining anything, so a companion in
+/// trouble is still the most useful thing to report.
+fn workload_explains_itself(status: &DriverSandboxStatus) -> bool {
+    status.conditions.iter().any(|condition| {
+        condition.r#type == "Ready"
+            && condition.status == "False"
+            && matches!(
+                condition.reason.as_str(),
+                CONDITION_EXITED | CONDITION_STOPPED | CONDITION_RUNTIME_RESTART | CONDITION_PAUSED
+            )
+    })
 }
 
 /// Per-sandbox `limits.processes` override from `driver_config.max_processes`.
@@ -1187,6 +1227,168 @@ mod tests {
         // sandbox called `foo` left behind is not this one's, however much
         // its name and role agree.
         assert!(!is_companion_of(&mine, "foo", Some("id-of-foo-the-second")));
+    }
+
+    /// The companion goes down with the workload it supervises, so this is
+    /// the ordinary case, not an exotic one: without the guard every crashed
+    /// sandbox reported its companion's exit instead of its own, and lost the
+    /// console log that said why.
+    #[test]
+    fn a_companion_never_overwrites_a_workload_that_is_explaining_itself() {
+        let companion_exited = instance_with(
+            "Stopped",
+            &[
+                (KEY_SANDBOX_ID, "id"),
+                (KEY_ROLE, ROLE_SUPERVISOR),
+                (KEY_WORKLOAD_INSTANCE, "sb"),
+                (KEY_LAST_POWER, "STOPPED"),
+            ],
+        );
+        let companion_errored = instance_with(
+            "Error",
+            &[
+                (KEY_SANDBOX_ID, "id"),
+                (KEY_ROLE, ROLE_SUPERVISOR),
+                (KEY_WORKLOAD_INSTANCE, "sb"),
+            ],
+        );
+
+        for reason in [
+            CONDITION_EXITED,
+            CONDITION_STOPPED,
+            CONDITION_RUNTIME_RESTART,
+            CONDITION_PAUSED,
+        ] {
+            for companion in [&companion_exited, &companion_errored] {
+                let mut sandbox = DriverSandbox {
+                    status: Some(DriverSandboxStatus {
+                        conditions: vec![DriverCondition {
+                            r#type: "Ready".to_string(),
+                            status: "False".to_string(),
+                            reason: reason.to_string(),
+                            message: "the workload's own message".to_string(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+
+                aggregate_companion_status(&mut sandbox, Some(companion));
+
+                let condition = &sandbox.status.expect("status").conditions[0];
+                assert_eq!(condition.reason, reason);
+                assert_eq!(condition.message, "the workload's own message");
+            }
+        }
+    }
+
+    /// ...but a workload that is not explaining anything still gets its
+    /// companion's trouble reported, which is the only way it surfaces.
+    #[test]
+    fn a_companion_in_trouble_downgrades_a_workload_with_nothing_to_say() {
+        let mut sandbox = DriverSandbox {
+            status: Some(DriverSandboxStatus {
+                conditions: vec![DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        aggregate_companion_status(
+            &mut sandbox,
+            Some(&instance_with(
+                "Stopped",
+                &[
+                    (KEY_SANDBOX_ID, "id"),
+                    (KEY_ROLE, ROLE_SUPERVISOR),
+                    (KEY_WORKLOAD_INSTANCE, "sb"),
+                    (KEY_LAST_POWER, "STOPPED"),
+                ],
+            )),
+        );
+
+        let condition = &sandbox.status.expect("status").conditions[0];
+        assert_eq!(condition.status, "False");
+        assert_eq!(condition.reason, CONDITION_EXITED);
+        assert!(condition.message.contains("companion"), "{condition:?}");
+    }
+
+    /// A sandbox is only as ready as its trusted half, and the companion is
+    /// hidden from every other query, so this is the only place its absence
+    /// can be reported.
+    #[test]
+    fn a_missing_companion_makes_a_running_sandbox_not_ready() {
+        let mut sandbox = DriverSandbox {
+            status: Some(DriverSandboxStatus {
+                conditions: vec![DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        aggregate_companion_status(&mut sandbox, None);
+
+        let conditions = sandbox.status.expect("status").conditions;
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].status, "False");
+        assert_eq!(conditions[0].reason, CONDITION_STARTING);
+    }
+
+    /// A workload that is already reporting why it is not running keeps
+    /// saying so: replacing it would lose the reason the gateway needs.
+    #[test]
+    fn a_missing_companion_does_not_overwrite_a_workloads_own_reason() {
+        let mut sandbox = DriverSandbox {
+            status: Some(DriverSandboxStatus {
+                conditions: vec![DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: CONDITION_EXITED.to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        aggregate_companion_status(&mut sandbox, None);
+
+        assert_eq!(
+            sandbox.status.expect("status").conditions[0].reason,
+            CONDITION_EXITED
+        );
+    }
+
+    /// A companion that is running says nothing the workload has not said.
+    #[test]
+    fn a_running_companion_leaves_the_sandbox_alone() {
+        let mut sandbox = DriverSandbox {
+            status: Some(DriverSandboxStatus {
+                conditions: vec![DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: "ContainerRunning".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        aggregate_companion_status(&mut sandbox, Some(&instance_with("Running", &[])));
+
+        let conditions = sandbox.status.expect("status").conditions;
+        assert_eq!(conditions[0].status, "True");
+        assert_eq!(conditions[0].reason, "ContainerRunning");
     }
 
     /// The init script boots two different binaries with two different

@@ -722,10 +722,14 @@ mod tests {
                 other => panic!("expected a snapshot, got {other:?}"),
             }
         }
+        // Neither sandbox has a supervisor companion in this fake LXD, so the
+        // running one is not ready: a workload with no trusted half is not a
+        // working sandbox. The exited one keeps its own reason, which is the
+        // one the gateway needs.
         assert_eq!(
             snapshots,
             HashMap::from([
-                ("id-running".to_string(), String::new()),
+                ("id-running".to_string(), "ContainerStarting".to_string()),
                 ("id-exited".to_string(), "ContainerExited".to_string()),
             ])
         );

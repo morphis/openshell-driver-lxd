@@ -1465,10 +1465,41 @@ impl LxdComputeDriver {
                 .get(mapping::KEY_SANDBOX_ID)
                 .cloned()
                 .unwrap_or_default();
+            let mut had_stop_intent = instance.config.contains_key(mapping::KEY_STOP_INTENT);
             match instance.status.as_str() {
                 "Stopped" => {}
-                // Already up, or on its way there.
-                "Running" | "Ready" | "Starting" => return Ok(()),
+                // Already up, or on its way there — unless the companion
+                // never attached. The attach runs after the workload is up
+                // and can be lost to a failed file push, a DHCP wait that
+                // times out, or the driver being cancelled or restarted mid
+                // way; what it leaves behind is a running workload beside a
+                // companion that is stopped with its deliberate-stop marker
+                // still on it. That pair reads as "starting", which is true
+                // of the create window and false for ever afterwards, and a
+                // start that returned OK here would leave the gateway waiting
+                // on a sandbox that has nothing left to finish it.
+                //
+                // RFC 0012 gives every start-from-stopped a fresh session, so
+                // the half-started generation cannot be resumed: it is
+                // stopped here and started again below, which is what a
+                // caller asking for a start wants anyway.
+                "Running" | "Ready" | "Starting" => {
+                    let companion = self.companion_of(name, Some(&sandbox_id)).await;
+                    let attached = companion
+                        .as_ref()
+                        .is_some_and(|companion| !companion.status.eq_ignore_ascii_case("Stopped"));
+                    if attached || instance.status == "Starting" {
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        sandbox = %name,
+                        "workload is running with its companion stopped; the attach did not \
+                         finish, so the sandbox is being started again from stopped"
+                    );
+                    self.set_stop_intent(name).await;
+                    had_stop_intent = true;
+                    self.stop_instance_with_deadline(name).await?;
+                }
                 // Anything else — paused, stopping, broken — would not be running
                 // after an "OK" here.
                 other => {
