@@ -25,8 +25,8 @@
 #   UPSTREAM_E2E_RUST_TESTS    space-separated Rust test targets to run
 #   UPSTREAM_E2E_PYTHON_TESTS  space-separated Python test files to run
 #
-# Needs rootless podman (with uidmap and passt) for the fixture server the
-# forward-proxy L7 tests start, and python3 >= 3.11.
+# Needs rootless podman (with uidmap and passt) and python3 >= 3.11 only for
+# the Python suite, which is empty by default — see DEFAULT_PYTHON_TESTS.
 
 set -euo pipefail
 
@@ -103,8 +103,30 @@ PYTHON_TEST_REQUIREMENTS=(
 # driver. Left out: `transparent_tcp` (Docker/Podman driver networking only)
 # and `live_policy_update`'s local override test (compiled for the Docker
 # lane only).
-DEFAULT_RUST_TESTS="landlock no_proxy live_policy_update proxy_egress_pipeline credential_gating host_gateway_alias forward_proxy_l7_bypass forward_proxy_graphql_l7 forward_proxy_jsonrpc_l7"
-DEFAULT_PYTHON_TESTS="test_inference_routing.py test_sandbox_policy.py test_policy_validation.py test_sandbox_landlock.py"
+# The targets that pass against a driver reached over the compute-driver
+# socket, which is the only way an out-of-tree driver can be reached.
+#
+# The rest of the suite cannot pass against *any* driver as it stands, and that
+# was measured rather than assumed. `landlock`, `proxy_egress_pipeline`,
+# `credential_gating`, `host_gateway_alias` and the three `forward_proxy_*`
+# targets set `run_as_user: sandbox` in their policies, while the image
+# upstream's own harness pins (`ghcr.io/astral-sh/uv:...trixie-slim`) has no
+# non-root account at all — so a conforming driver refuses the create.
+# Upstream's *own* Podman driver, built from this same revision and driven the
+# same way on the same host, refuses every one of them in almost the same
+# words: "configure a non-root workload user present in the pinned image".
+#
+# Upstream does not run these targets against an external driver either: its
+# `*-external-driver-e2e` jobs set the feature set empty, which makes
+# `e2e/rust/e2e-podman.sh` stop after conformance. The full Rust suite runs only
+# on the bundled-driver path, where the gateway and the driver are one process.
+#
+# Add them back when that mismatch is fixed upstream, or when this repository
+# grows a harness that supplies its own image and policy — an image with a
+# `sandbox` account is all these targets need.
+DEFAULT_RUST_TESTS="no_proxy live_policy_update"
+# The Python suite goes the same way, and for the same reason.
+DEFAULT_PYTHON_TESTS=""
 
 RUST_TESTS="${UPSTREAM_E2E_RUST_TESTS:-$DEFAULT_RUST_TESTS}"
 PYTHON_TESTS="${UPSTREAM_E2E_PYTHON_TESTS:-$DEFAULT_PYTHON_TESTS}"
@@ -226,12 +248,16 @@ run_python_tests() {
 cmd_e2e() {
     [ "$#" -eq 0 ] || die "usage: $0 (takes no arguments; see scripts/openshell-env.sh to manage the environment)"
     require_tools
-    require_e2e_tools
     ensure_not_running
     fetch_openshell
     fetch_source
     build_rust_tests
-    setup_python
+    # Both cost several minutes and are only for the Python suite, which is
+    # empty by default: podman is what its fixture server runs in.
+    if [ -n "$PYTHON_TESTS" ]; then
+        require_e2e_tools
+        setup_python
+    fi
 
     env_up_for_suite
     mkdir -p "$SUITE_ARTIFACTS_DIR"

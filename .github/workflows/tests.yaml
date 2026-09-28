@@ -67,12 +67,6 @@ jobs:
         # an LXD one, and to busybox-static for images missing a shell or `ip`.
         run: sudo apt-get install --no-install-recommends -y skopeo umoci squashfs-tools xz-utils busybox-static
 
-      - name: Install e2e dependencies
-        if: matrix.suite == 'upstream-e2e'
-        # Rootless podman for the fixture server the forward-proxy L7 tests
-        # start; uidmap and passt are what make it rootless.
-        run: sudo apt-get install --no-install-recommends -y podman uidmap passt
-
       - name: Bootstrap MicroCloud with OVN
         run: make setup-ovn-test-env
 
