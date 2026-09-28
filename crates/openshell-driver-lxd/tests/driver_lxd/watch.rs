@@ -238,7 +238,7 @@ async fn unmanaged_instances_are_not_pushed() {
 
     // Starting it produces lifecycle events; its init has no supervisor to
     // exec and exits, producing more.
-    lxc(&["init", &alias, &unmanaged]);
+    lxc_init_unmanaged(&alias, &unmanaged);
     let _ = lxc_output(&["start", &unmanaged]);
     watch
         .expect_silence_about(&unmanaged, "", Duration::from_secs(5))
@@ -290,7 +290,7 @@ async fn out_of_band_delete_of_an_unmanaged_instance_is_not_pushed() {
     let name = unique_name("wunmdel");
     let _cleanup = driver.cleanup(&[&name]);
     let alias = ensure_sandbox_image();
-    lxc(&["init", &alias, &name]);
+    lxc_init_unmanaged(&alias, &name);
     let mut watch = driver.watch().await;
 
     lxc(&["delete", "--force", &name]);

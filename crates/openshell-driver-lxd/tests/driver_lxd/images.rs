@@ -184,20 +184,20 @@ async fn converted_image_keeps_file_ownership() {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     };
 
-    let sandbox_ids = exec("echo $(id -u sandbox):$(id -g sandbox)");
-    assert_ne!(
-        sandbox_ids, "0:0",
-        "the base image defines a non-root sandbox user"
+    // `umoci unpack --rootless` cannot chown, so it records each file's owner
+    // in an xattr and the driver replays it into the squashfs. Without that
+    // replay everything in the image would belong to root, and a sandbox
+    // running as its unprivileged workload identity could not write its own
+    // home.
+    let home = exec("getent passwd 1000 | cut -d: -f6");
+    assert!(
+        !home.is_empty(),
+        "the base image defines an account at uid 1000 for the workload to run as"
     );
     assert_eq!(
-        exec("stat -c %u:%g /sandbox"),
-        sandbox_ids,
-        "/sandbox owner"
-    );
-    assert_eq!(
-        exec("stat -c %u:%g /sandbox/.bashrc"),
-        sandbox_ids,
-        "files the image gives the sandbox user"
+        exec(&format!("stat -c %u:%g {home}")),
+        "1000:1000",
+        "the image gives uid 1000 its own home"
     );
     assert_eq!(
         exec("stat -c %u:%g /etc/passwd"),
@@ -205,20 +205,19 @@ async fn converted_image_keeps_file_ownership() {
         "system files stay root's"
     );
 
-    let uid = sandbox_ids.split(':').next().unwrap();
     let output = lxc_output(&[
         "exec",
         &name,
         "--user",
-        uid,
+        "1000",
         "--",
         "sh",
         "-c",
-        "echo ok > /sandbox/.written",
+        &format!("echo ok > {home}/.written"),
     ]);
     assert!(
         output.status.success(),
-        "the sandbox user cannot write its workdir: {}",
+        "the workload identity cannot write its own home: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -263,12 +262,12 @@ async fn concurrent_creates_share_one_import() {
     );
 
     for (name, result) in [(&a, ra), (&b, rb)] {
+        // A create that fails here leaves no instance behind, so the reason it
+        // gave is the only evidence there is. Swallowing it made a flake in
+        // this test undiagnosable from the log alone: the driver never
+        // mentions a sandbox whose create failed before it reached LXD.
         if let Err(status) = result {
-            assert_ne!(
-                status.code(),
-                Code::Internal,
-                "{name} failed on the shared import: {status}"
-            );
+            panic!("{name} failed: {:?} {status}", status.code());
         }
         assert!(
             lxd().get_instance(name).await.is_ok(),

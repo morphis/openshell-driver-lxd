@@ -258,6 +258,35 @@ pub fn standin_supervisor() -> PathBuf {
     .clone()
 }
 
+/// The storage pool the host's `default` profile puts root disks on.
+///
+/// Not hardcoded: these tests need an OVN host now — sandboxes cannot be
+/// fenced anywhere else — and an OVN host is usually a MicroCloud, whose pool
+/// is `local` or `remote` rather than `default`.
+pub fn default_pool() -> String {
+    static POOL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let shown = lxc(&["profile", "device", "get", "default", "root", "pool"]);
+        let pool = shown.trim().to_string();
+        assert!(
+            !pool.is_empty(),
+            "the default profile has no root disk device; these tests read the host's \
+             pool from it"
+        );
+        pool
+    })
+    .clone()
+}
+
+/// Creates a stopped instance the driver did not make, on the host's own pool.
+///
+/// `lxc init` alone needs the default profile to carry a root disk, which a
+/// MicroCloud's does not always: its projects are laid out per deployment.
+pub fn lxc_init_unmanaged(alias: &str, name: &str) {
+    let pool = default_pool();
+    lxc(&["init", alias, name, "-d", &format!("root,pool={pool}")]);
+}
+
 /// Runs `lxc` and returns stdout, panicking with stderr on failure.
 pub fn lxc(args: &[&str]) -> String {
     let output = lxc_output(args);
@@ -337,6 +366,10 @@ pub struct DriverOptions {
     /// virtual router. Nothing in these tests dials it: the stand-in
     /// supervisor never connects to a gateway, and the address is here so the
     /// sandbox's egress ACL has a gateway rule to write.
+    ///
+    /// `None` lets the harness supply one, unless `extra_args` already does:
+    /// the driver takes the option once, and its scheme has to agree with
+    /// whether the test gives sandboxes TLS materials.
     pub gateway_endpoint: Option<String>,
     /// Lets the driver clean up (`--cleanup-interval-secs`). Off by default:
     /// test drivers run in parallel against the same project, and one's
@@ -355,7 +388,7 @@ impl Default for DriverOptions {
             image_work_dir: image_work_dir(),
             start_retries: 1,
             allow_plaintext_gateway: true,
-            gateway_endpoint: Some("http://127.0.0.1:17670".to_string()),
+            gateway_endpoint: None,
             cleanup: false,
             extra_args: Vec::new(),
         }
@@ -453,8 +486,21 @@ impl Driver {
         if options.allow_plaintext_gateway {
             cmd.arg("--allow-plaintext-gateway");
         }
+        let sets_own_endpoint = options
+            .extra_args
+            .iter()
+            .any(|arg| arg == "--gateway-endpoint");
         if let Some(endpoint) = &options.gateway_endpoint {
             cmd.args(["--gateway-endpoint", endpoint]);
+        } else if !sets_own_endpoint {
+            // The driver rejects an http endpoint for sandboxes it gives TLS
+            // materials to, so the scheme follows the test's own options.
+            let tls = options
+                .extra_args
+                .iter()
+                .any(|arg| arg.starts_with("--guest-tls-"));
+            let scheme = if tls { "https" } else { "http" };
+            cmd.args(["--gateway-endpoint", &format!("{scheme}://127.0.0.1:17670")]);
         }
         if !options.cleanup {
             cmd.args(["--cleanup-interval-secs", "0"]);
@@ -864,16 +910,6 @@ where
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-}
-
-/// The IPv4 address of the host side of `network`, e.g. `10.146.74.1`.
-pub async fn bridge_ipv4(network: &str) -> String {
-    let network = lxd().get_network(network).await.expect("get network");
-    let cidr = network
-        .config
-        .get("ipv4.address")
-        .expect("network has ipv4.address");
-    cidr.split('/').next().unwrap().to_string()
 }
 
 pub fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {

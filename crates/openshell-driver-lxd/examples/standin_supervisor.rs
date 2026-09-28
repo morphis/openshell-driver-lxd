@@ -100,6 +100,7 @@ fn apply_child_env(args: &[String]) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     println!("odl-standin: started args={args:?}");
+    apply_child_env(&args);
 
     let mut env: Vec<(String, String)> = std::env::vars()
         .filter(|(key, _)| key.starts_with("OPENSHELL_"))

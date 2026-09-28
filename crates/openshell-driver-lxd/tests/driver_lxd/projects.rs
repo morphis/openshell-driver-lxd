@@ -53,11 +53,12 @@ impl Drop for Project {
         for instance in list(&["list", "--project", project, "--format", "csv", "-c", "n"]) {
             let _ = lxc_output(&["delete", "--force", &instance, "--project", project]);
         }
+        let pool = default_pool();
         for line in list(&[
             "storage",
             "volume",
             "list",
-            "default",
+            &pool,
             "--project",
             project,
             "--format",
@@ -71,7 +72,7 @@ impl Drop for Project {
                     "storage",
                     "volume",
                     "delete",
-                    "default",
+                    &pool,
                     volume,
                     "--project",
                     project,
@@ -138,11 +139,12 @@ async fn sandboxes_stay_inside_the_driver_project() {
     in_project.create_running(&name).await;
 
     // The volumes the sandbox mounts were provisioned in the project.
+    let pool = default_pool();
     let volumes = lxc(&[
         "storage",
         "volume",
         "list",
-        "default",
+        &pool,
         "--project",
         &project.name,
         "--format",
@@ -272,7 +274,7 @@ async fn cleanup_removes_what_the_driver_no_longer_uses() {
             "storage",
             "volume",
             "create",
-            "default",
+            &default_pool(),
             volume,
             "--project",
             &project.name,
@@ -292,11 +294,12 @@ async fn cleanup_removes_what_the_driver_no_longer_uses() {
     })
     .await;
 
+    let pool = default_pool();
     let volumes = lxc(&[
         "storage",
         "volume",
         "list",
-        "default",
+        &pool,
         "--project",
         &project.name,
         "--format",
