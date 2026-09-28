@@ -301,10 +301,35 @@ pub struct LxdFenceEvidence {
     pub network: String,
     /// The network's LXD type. Only `ovn` can carry a per-NIC ACL.
     pub network_type: String,
-    /// The driver-managed egress ACL on the workload's NIC.
-    pub egress_acl: String,
-    /// Any further network the workload was found attached to.
-    pub unexpected_networks: Vec<String>,
+    /// The driver-managed ACL the workload's NIC was asked to carry, and the
+    /// only one it may carry. It grants inbound Sandbox Protocol and nothing
+    /// outbound.
+    pub fence_acl: String,
+    /// The ACLs LXD reports on that NIC, read back from the created instance.
+    pub applied_acls: Vec<String>,
+    /// The NIC's default actions, read back from the created instance. Both
+    /// have to be `reject` for the ACL to be a fence rather than a filter:
+    /// with a default of `allow`, the rules the driver wrote would be the
+    /// exceptions to an open NIC instead of the only way off it.
+    pub default_egress_action: String,
+    pub default_ingress_action: String,
+    /// The ACLs set on the *network* itself, read back from its config.
+    ///
+    /// LXD applies an OVN network's own `security.acls` to every NIC on that
+    /// network, and those never appear on the NIC device — so an ACL added
+    /// here is one the per-NIC reading cannot see. An operator, or another
+    /// tool sharing the network, could grant the workload egress with rules
+    /// the driver neither wrote nor knows about while it went on attesting a
+    /// default-deny fence. Recorded so the digest commits to it, and required
+    /// to be empty for the fence to hold.
+    pub network_acls: Vec<String>,
+    /// Every device found on the workload that could carry a packet off it
+    /// without passing the fenced NIC: a second NIC, wherever it points, and
+    /// a `proxy` device, which forwards outside OVN altogether.
+    pub unmediated_egress_paths: Vec<String>,
+    /// What the fence does not deny even when it is fully in force. See
+    /// [`LxdFenceEvidence::DEFAULT_DENY_EGRESS_EXCEPTS`].
+    pub default_deny_egress_excepts: &'static str,
 }
 
 impl LxdFenceEvidence {
@@ -321,19 +346,29 @@ impl LxdFenceEvidence {
     /// - and they are enforced by OVN rather than by the supervisor
     ///   companion, so the fence outlives the process that drives it.
     ///
-    /// The last guarantee is separate: a second NIC would be an egress path
-    /// no ACL of this driver's covers, so it is read back from the created
+    /// The last guarantee is separate: anything else that can carry a packet
+    /// off the workload — a second NIC, wherever it points, or a `proxy`
+    /// device, which forwards outside OVN altogether — is an egress path no
+    /// ACL of this driver's covers, so it is read back from the created
     /// instance rather than assumed from the request.
+    ///
+    /// Every input here is likewise read back from the instance, never taken
+    /// from what the create asked for. An ACL name the driver *meant* to
+    /// apply says nothing about whether LXD applied it, and attesting from
+    /// intent would make the whole confinement claim true by construction:
+    /// exactly as sound-looking with the ACL in force as without it.
+    /// Upstream's Podman driver inspects its container the same way before it
+    /// projects (`verify_isolation_fence`).
     pub fn project(&self, generation: &str) -> Result<OuterFenceGuarantees, DriverError> {
         let mut established = BTreeSet::new();
-        if !self.egress_acl.is_empty() {
+        if self.fence_is_in_force() {
             established.extend([
                 OuterFenceGuarantee::DefaultDenyEgress,
                 OuterFenceGuarantee::RevocationVerified,
                 OuterFenceGuarantee::ControllerLossFailsClosed,
             ]);
         }
-        if self.unexpected_networks.is_empty() {
+        if self.unmediated_egress_paths.is_empty() {
             established.insert(OuterFenceGuarantee::NoUnmanagedEgressPath);
         }
         let evidence = serde_json::to_vec(self)
@@ -346,7 +381,68 @@ impl LxdFenceEvidence {
         guarantees.validate(generation)?;
         Ok(guarantees)
     }
+
+    /// What `DefaultDenyEgress` does *not* cover here, recorded so the claim
+    /// is legible where it is made.
+    ///
+    /// LXD lets an OVN NIC reach the services its own network provides —
+    /// DHCP, and the network's DNS resolver — whatever its ACLs say, and
+    /// offers no way to turn that off. The sandbox depends on it: the init
+    /// script gets its address by DHCP, and nothing else would answer.
+    ///
+    /// So a workload that gets past the boundary's own in-guest mediation
+    /// still has a recursive resolver it can reach, which is a channel a
+    /// determined one can carry data over. Upstream's `DefaultDenyEgress`
+    /// reads "no workload packet can leave without an explicit mediated
+    /// decision", and on this backend that holds for everything except the
+    /// network's own resolver. Podman's fence is `network_mode: none` and has
+    /// no such exception; this one cannot be brought to that, because a
+    /// sandbox with no network at all cannot reach its gateway.
+    ///
+    /// It is recorded in the evidence rather than only in a comment: the
+    /// digest commits to it, so what the driver attested and what it knew it
+    /// was attesting cannot drift apart.
+    pub const DEFAULT_DENY_EGRESS_EXCEPTS: &'static str =
+        "the OVN network's own DHCP and DNS services, which LXD always permits";
+
+    /// Whether what was read back off the NIC is actually a fence.
+    ///
+    /// All four conditions matter, and none can be inferred from another:
+    ///
+    /// - the network is OVN, because LXD applies `security.acls` to a NIC
+    ///   only there — a bridge takes the keys and ignores them;
+    /// - the driver's own ACL is among those the NIC carries, so the rules in
+    ///   force are the ones the driver wrote;
+    /// - egress defaults to `reject`, so the driver's rules are the only way
+    ///   off the NIC rather than exceptions to an open one;
+    /// - ingress defaults to `reject` too, so nothing reaches the workload
+    ///   that the driver did not allow;
+    /// - and the network carries no ACLs of its own, which LXD would apply to
+    ///   this NIC without recording them on it.
+    fn fence_is_in_force(&self) -> bool {
+        self.network_type.eq_ignore_ascii_case(NETWORK_TYPE_OVN)
+            && !self.fence_acl.is_empty()
+            // Nothing applied at the network level. Those rules reach this
+            // NIC without ever appearing on it, so they are egress the driver
+            // did not grant and the per-NIC reading below would not notice.
+            && self.network_acls.is_empty()
+            // Exactly this ACL and nothing else. The workload's ACL carries
+            // no egress rules at all, so with both defaults at `reject` it
+            // has no way off the NIC — that is the guarantee. A second ACL
+            // here, whether the network's shared one or something a profile
+            // attached, would be egress this driver did not grant and cannot
+            // account for, so it is refused rather than attested around.
+            && self.applied_acls == [self.fence_acl.clone()]
+            && self.default_egress_action == ACL_ACTION_REJECT
+            && self.default_ingress_action == ACL_ACTION_REJECT
+    }
 }
+
+/// The one LXD network type that applies an ACL to an individual NIC.
+pub const NETWORK_TYPE_OVN: &str = "ovn";
+
+/// The NIC default action a fence requires in both directions.
+pub const ACL_ACTION_REJECT: &str = "reject";
 
 impl OuterFenceGuarantees {
     /// Refuses an incomplete fence here, where the reason is legible, rather
@@ -510,6 +606,7 @@ pub struct BoundaryArtifacts {
     fence: OuterFenceGuarantees,
     resource_claims: BTreeMap<String, String>,
     tls: SandboxTlsMaterial,
+    host_gateway_ip: Option<std::net::IpAddr>,
 }
 
 impl BoundaryArtifacts {
@@ -523,6 +620,7 @@ impl BoundaryArtifacts {
         identity: ResolvedWorkloadIdentity,
         fence: &LxdFenceEvidence,
         resource_claims: BTreeMap<String, String>,
+        host_gateway_ip: Option<std::net::IpAddr>,
     ) -> Result<Self, DriverError> {
         let generation = launch.view.runtime_generation.clone();
         validate_resource_claims(&resource_claims)?;
@@ -534,6 +632,7 @@ impl BoundaryArtifacts {
             identity,
             resource_claims,
             tls: generate_sandbox_tls_material(&launch.view.session_id)?,
+            host_gateway_ip,
         })
     }
 
@@ -631,7 +730,7 @@ impl BoundaryArtifacts {
                 server_name: self.tls.server_name.clone(),
                 trust_anchor_pem: self.tls.trust_anchor_pem.clone(),
             },
-            host_gateway_ip: None,
+            host_gateway_ip: self.host_gateway_ip,
             resource_claims: self.resource_claims.clone(),
             outer_fence: self.fence.clone(),
         };
@@ -648,12 +747,27 @@ impl BoundaryArtifacts {
 /// Conventional unprivileged account OpenShell sandbox images ship.
 const DEFAULT_SANDBOX_USER: &str = "sandbox";
 
+/// Identity synthesized for an image that defines no such account.
+///
+/// Upstream's `sandbox_env::DEFAULT_SANDBOX_UID`/`DEFAULT_SANDBOX_GID`, which
+/// its Docker and Podman drivers supply "so the supervisor runs the sandbox as
+/// a synthesized non-root account instead of rejecting the image". OpenShell's
+/// own default sandbox image is a plain Ubuntu base with no `sandbox` user, so
+/// rejecting it would reject the default.
+const DEFAULT_SANDBOX_UID: u32 = 1000;
+const DEFAULT_SANDBOX_GID: u32 = 1000;
+
 /// Resolves the immutable numeric identity the workload runs as.
 ///
 /// Resolution order, narrowest first:
 ///
 /// 1. `spec.workload_identity`, the selectors admitted by the gateway;
-/// 2. the conventional [`DEFAULT_SANDBOX_USER`] account, when the image ships one.
+/// 2. the conventional [`DEFAULT_SANDBOX_USER`] account, when the image ships one;
+/// 3. [`DEFAULT_SANDBOX_UID`]/[`DEFAULT_SANDBOX_GID`], synthesized.
+///
+/// Only the first is an error when it cannot be met: a selector the gateway
+/// admitted and the image does not define is a mismatch worth reporting, while
+/// an image that simply ships no conventional account is ordinary.
 ///
 /// Both are resolved against the pinned image's own `/etc/passwd` and
 /// `/etc/group`, never against the host: the numbers must mean the same thing
@@ -694,11 +808,7 @@ pub fn resolve_workload_identity(
 
     let requested_user = requested_user.trim();
     let requested_group = requested_group.trim();
-    let source = if requested_user.is_empty() && requested_group.is_empty() {
-        "image"
-    } else {
-        "policy"
-    };
+    let asked_for = !requested_user.is_empty() || !requested_group.is_empty();
     let user = if requested_user.is_empty() {
         DEFAULT_SANDBOX_USER
     } else {
@@ -708,6 +818,22 @@ pub fn resolve_workload_identity(
     let account = accounts
         .iter()
         .find(|(name, uid, _)| *name == user || user.parse::<u32>().ok() == Some(*uid));
+
+    // Nothing was asked for and the image defines no conventional account:
+    // synthesize one, as upstream's own local-container drivers do rather than
+    // reject the image. OpenShell's default sandbox image is a plain Ubuntu
+    // base with no `sandbox` user, so refusing here would refuse the default.
+    if !asked_for && account.is_none() {
+        return Ok(ResolvedWorkloadIdentity {
+            uid: DEFAULT_SANDBOX_UID,
+            gid: DEFAULT_SANDBOX_GID,
+            supplementary_gids: Vec::new(),
+            source: "driver".to_string(),
+            resource_digest: resource_digest.to_string(),
+        });
+    }
+
+    let source = if asked_for { "policy" } else { "image" };
     let uid: u32 = user
         .parse()
         .ok()
@@ -945,24 +1071,96 @@ mod tests {
         assert!(format!("{err}").contains("unprivileged"), "{err}");
     }
 
+    /// OpenShell's own default sandbox image is a plain Ubuntu base with no
+    /// `sandbox` account, so this is the ordinary case rather than an error.
     #[test]
-    fn an_image_without_the_conventional_account_is_a_clear_error() {
-        let err = resolve_workload_identity("", "", b"root:x:0:0::/root:/bin/sh\n", GROUP, "d")
-            .unwrap_err();
+    fn an_image_without_the_conventional_account_gets_a_synthesized_identity() {
+        let id = resolve_workload_identity("", "", b"root:x:0:0::/root:/bin/sh\n", GROUP, "d")
+            .expect("an image with no sandbox account is not an error");
+        assert_eq!((id.uid, id.gid), (1000, 1000));
+        assert_eq!(id.source, "driver");
+        assert!(id.supplementary_gids.is_empty());
+    }
+
+    /// A selector the gateway admitted and the image does not define is a
+    /// mismatch worth reporting, and does not fall back.
+    #[test]
+    fn a_requested_account_the_image_lacks_is_a_clear_error() {
+        let err =
+            resolve_workload_identity("agent", "", b"root:x:0:0::/root:/bin/sh\n", GROUP, "d")
+                .unwrap_err();
         assert!(
             format!("{err}").contains("not present in the pinned image"),
             "{err}"
         );
     }
 
+    /// A NIC read back exactly as a fenced sandbox's looks.
     fn fenced_evidence() -> LxdFenceEvidence {
         LxdFenceEvidence {
             instance_name: "test-sb".to_string(),
             network: "sandboxes".to_string(),
-            network_type: "ovn".to_string(),
-            egress_acl: "openshell-egress-sandboxes".to_string(),
-            unexpected_networks: vec![],
+            network_type: NETWORK_TYPE_OVN.to_string(),
+            fence_acl: "openshell-sbp-abc123".to_string(),
+            applied_acls: vec!["openshell-sbp-abc123".to_string()],
+            network_acls: vec![],
+            default_egress_action: ACL_ACTION_REJECT.to_string(),
+            default_ingress_action: ACL_ACTION_REJECT.to_string(),
+            unmediated_egress_paths: vec![],
+            default_deny_egress_excepts: LxdFenceEvidence::DEFAULT_DENY_EGRESS_EXCEPTS,
         }
+    }
+
+    /// The whole point of reading the NIC back: an ACL the driver meant to
+    /// apply, on a NIC that does not carry it or does not default to reject,
+    /// is not a fence — and attesting one from the request would make the
+    /// confinement claim exactly as sound-looking either way.
+    #[test]
+    fn a_fence_is_attested_from_the_nic_and_not_from_the_request() {
+        for (what, break_it) in [
+            (
+                "the ACL never reached the NIC",
+                (|e: &mut LxdFenceEvidence| e.applied_acls.clear()) as fn(&mut LxdFenceEvidence),
+            ),
+            ("another ACL reached it instead", |e| {
+                e.applied_acls = vec!["someone-elses-acl".to_string()];
+            }),
+            // An extra ACL is extra egress the driver did not grant.
+            ("a second ACL was attached alongside it", |e| {
+                e.applied_acls
+                    .push("openshell-egress-sandboxes".to_string());
+            }),
+            ("egress still defaults to allow", |e| {
+                e.default_egress_action = "allow".to_string();
+            }),
+            ("ingress still defaults to allow", |e| {
+                e.default_ingress_action = "allow".to_string();
+            }),
+            ("the network cannot carry a per-NIC ACL", |e| {
+                e.network_type = "bridge".to_string();
+            }),
+            // Applied to every NIC on the network by LXD, and never recorded
+            // on the NIC device — so a fence read from the NIC alone would
+            // attest right past it.
+            ("the network itself carries an ACL", |e| {
+                e.network_acls = vec!["someone-elses-network-acl".to_string()];
+            }),
+        ] {
+            let mut evidence = fenced_evidence();
+            break_it(&mut evidence);
+            let err = evidence
+                .project("g1")
+                .expect_err("projected a fence when {what}");
+            assert!(
+                matches!(err, DriverError::FailedPrecondition(_)),
+                "{what}: {err}"
+            );
+        }
+
+        // ...and the unbroken read still projects all four.
+        fenced_evidence()
+            .project("g1")
+            .expect("a NIC that carries the fence projects every guarantee");
     }
 
     /// Without the ACL there is no default deny, and upstream requires every
@@ -970,17 +1168,33 @@ mod tests {
     #[test]
     fn a_sandbox_without_an_egress_acl_cannot_be_fenced() {
         let mut evidence = fenced_evidence();
-        evidence.egress_acl = String::new();
+        evidence.fence_acl = String::new();
         let err = evidence.project("g1").unwrap_err();
         assert!(format!("{err}").contains("OVN network"), "{err}");
     }
 
-    /// A second NIC is an egress path the driver's ACL does not cover.
+    /// Anything that can carry a packet off the workload without passing
+    /// the fenced NIC leaves the fence incomplete, whatever it is.
     #[test]
-    fn a_second_network_cannot_be_fenced() {
-        let mut evidence = fenced_evidence();
-        evidence.unexpected_networks = vec!["lxdbr0".to_string()];
-        assert!(evidence.project("g1").is_err());
+    fn an_unmediated_egress_path_cannot_be_fenced() {
+        for path in [
+            // A NIC on another network: always caught.
+            "eth1: nic on lxdbr0",
+            // A second NIC on the *same* network: an ACL applies per NIC, so
+            // this one has none.
+            "eth1: nic on sandboxes",
+            // A NIC with no managed network at all, such as `nictype: p2p`.
+            "eth1: nic on no managed network",
+            // A proxy device forwards outside OVN entirely.
+            "sshport: proxy device",
+        ] {
+            let mut evidence = fenced_evidence();
+            evidence.unmediated_egress_paths = vec![path.to_string()];
+            assert!(
+                evidence.project("g1").is_err(),
+                "projected a complete fence despite {path}"
+            );
+        }
     }
 
     /// The digest binds the projection to what was observed, so two sandboxes
@@ -1056,15 +1270,9 @@ mod tests {
             source: "image".to_string(),
             resource_digest: "sha256:abc".to_string(),
         };
-        let fence = LxdFenceEvidence {
-            instance_name: "test-sb".to_string(),
-            network: "sandboxes".to_string(),
-            network_type: "ovn".to_string(),
-            egress_acl: "openshell-egress-sandboxes".to_string(),
-            unexpected_networks: vec![],
-        }
-        .project("g0000000000000007")
-        .expect("a fenced sandbox projects every guarantee");
+        let fence = fenced_evidence()
+            .project("g0000000000000007")
+            .expect("a fenced sandbox projects every guarantee");
         let descriptor = SandboxRuntimeDescriptor {
             boundary_id: "test-sb".to_string(),
             generation: "g0000000000000007".to_string(),
@@ -1078,7 +1286,7 @@ mod tests {
                 server_name: "sandbox.x.openshell.internal".to_string(),
                 trust_anchor_pem: "pem".to_string(),
             },
-            host_gateway_ip: None,
+            host_gateway_ip: Some("10.0.0.5".parse().unwrap()),
             resource_claims: BTreeMap::from([(
                 "lxd.instance_name".to_string(),
                 "test-sb".to_string(),
@@ -1100,6 +1308,9 @@ mod tests {
         );
         assert_eq!(json["outer_fence"]["generation"], "g0000000000000007");
         assert_eq!(json["workload_identity"]["uid"], 1000);
-        assert!(json["host_gateway_ip"].is_null());
+        // A bare address string, which is how upstream's `Option<IpAddr>`
+        // deserializes it. Without one the supervisor's network mediation
+        // refuses the reserved host-gateway aliases outright.
+        assert_eq!(json["host_gateway_ip"], "10.0.0.5");
     }
 }

@@ -245,6 +245,7 @@ async fn ensure_network_acl_create_update_delete() {
         .ensure_network_acl(
             &acl_name,
             vec![LxdNetworkAclRule::allow_egress_tcp("10.0.0.0/8", 8080)],
+            vec![LxdNetworkAclRule::allow_ingress_tcp("10.0.0.0/8", 50051)],
         )
         .await
         .expect("ensure_network_acl should create a new ACL");
@@ -256,7 +257,7 @@ async fn ensure_network_acl_create_update_delete() {
             .described("any protocol"),
     ];
     client
-        .ensure_network_acl(&acl_name, rules.clone())
+        .ensure_network_acl(&acl_name, rules.clone(), Vec::new())
         .await
         .expect("ensure_network_acl should update an existing ACL");
 
@@ -268,7 +269,7 @@ async fn ensure_network_acl_create_update_delete() {
         .await
         .expect("subscribe to lifecycle events");
     client
-        .ensure_network_acl(&acl_name, rules)
+        .ensure_network_acl(&acl_name, rules, Vec::new())
         .await
         .expect("ensure_network_acl with the same rules should succeed");
     assert!(
@@ -280,6 +281,7 @@ async fn ensure_network_acl_create_update_delete() {
         .ensure_network_acl(
             &acl_name,
             vec![LxdNetworkAclRule::allow_egress_tcp("192.168.0.0/16", 8443)],
+            Vec::new(),
         )
         .await
         .expect("ensure_network_acl should update changed rules");

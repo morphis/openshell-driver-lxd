@@ -247,18 +247,56 @@ carrying the driver's own alias/name conventions.
 ## Networking and egress
 
 Both of a sandbox's containers get a NIC on the resolved network, and the
-driver attaches an LXD network ACL (`egress.rs`) to each, allowing only:
+driver attaches two LXD network ACLs (`egress.rs`) to each. Between them they
+allow only:
 
-- outbound TCP to the resolved gateway endpoint, and
 - outbound traffic to public internet addresses (the complement of
   private/reserved IPv4 ranges and IPv6 unique-local/link-local/loopback
-  space),
+  space) — `openshell-egress-<network>`, shared by every sandbox on the
+  network;
+- outbound TCP to the resolved gateway endpoint, and the Sandbox Protocol
+  between this sandbox's own two halves — `openshell-sbp-<digest>`, one per
+  sandbox;
 
 with everything else — including inbound, except return traffic tracked by
 allowed connections — rejected. DNS needs no explicit rule: LXD lets an OVN
 NIC reach the network's own DNS resolvers regardless of ACLs. This confines
 the containers as a whole (beyond the boundary's own in-guest policy proxy)
 from reaching the LAN, the LXD host, or other sandboxes.
+
+The split matters twice over. The shared ACL is rewritten by every create on
+the network, so a rule that varies per sandbox — the gateway's resolved
+addresses — would be revoked for every other sandbox whenever one more was
+created; keeping it per sandbox means one sandbox's lifecycle is the only
+thing that rewrites its own rules. And the Sandbox Protocol rules name the
+per-sandbox ACL *itself* as their subject: LXD resolves an ACL name to the
+NICs carrying that ACL, so the boundary port is reachable by this sandbox's
+own companion and by nothing else. Writing it against the network's subnets
+instead — which is what an address-based rule has to do, since the companion
+gets its address from DHCP well after the workload is created — left every
+sandbox's boundary port reachable from every instance on the network.
+
+#### What the fence does not cover
+
+Two things, both recorded in the evidence the projection commits to rather
+than only in comments:
+
+- **The network's own DHCP and DNS.** LXD lets an OVN NIC reach the services
+  its network provides whatever its ACLs say, and offers no way to turn that
+  off — the sandbox depends on it, since the init script gets its address by
+  DHCP. So a workload that gets past the boundary's in-guest mediation still
+  has a recursive resolver it can reach, which is a channel data can be
+  carried over. Upstream's `DefaultDenyEgress` reads "no workload packet can
+  leave without an explicit mediated decision"; on this backend that holds
+  for everything but the network's own resolver. Podman's fence is
+  `network_mode: none` and has no such exception, and this one cannot be
+  brought to that: a sandbox with no network cannot reach its gateway.
+- **Anything attached beside the fenced NIC.** An ACL applies per NIC, so a
+  second NIC is an egress path this driver's ACL does not cover even when it
+  is on the same network, and a `proxy` device forwards between host and
+  container outside OVN entirely. Both are refused rather than fenced:
+  `collect_fence_evidence` lists them and the projection then withholds
+  `NoUnmanagedEgressPath`, so the sandbox never attaches.
 
 **This ACL is not optional, and it is why sandboxes need an OVN network.**
 From OpenShell v0.1.0 it is the sandbox's *outer network fence*: the driver

@@ -644,7 +644,7 @@ pub fn build_supervisor_config(
 /// and it is no more entitled to the LAN than the workload is.
 pub fn build_supervisor_devices(
     placement: Placement<'_>,
-    egress_acl: Option<&str>,
+    acls: &[&str],
     supervisor_pool: &str,
     supervisor_volume: &str,
     dhcp_client_pool: &str,
@@ -658,10 +658,7 @@ pub fn build_supervisor_devices(
     root.insert("path".to_string(), "/".to_string());
     devices.insert("root".to_string(), root);
 
-    devices.insert(
-        "eth0".to_string(),
-        sandbox_nic(placement.network, egress_acl),
-    );
+    devices.insert("eth0".to_string(), sandbox_nic(placement.network, acls));
 
     let mut supervisor = HashMap::new();
     supervisor.insert("type".to_string(), "disk".to_string());
@@ -686,12 +683,13 @@ pub fn build_supervisor_devices(
 ///
 /// The default actions are what make the ACL a fence: everything the rules do
 /// not name is rejected, in both directions.
-fn sandbox_nic(network: &str, egress_acl: Option<&str>) -> HashMap<String, String> {
+fn sandbox_nic(network: &str, acls: &[&str]) -> HashMap<String, String> {
     let mut nic = HashMap::new();
     nic.insert("type".to_string(), "nic".to_string());
     nic.insert("network".to_string(), network.to_string());
-    if let Some(acl) = egress_acl {
-        nic.insert("security.acls".to_string(), acl.to_string());
+    let acls: Vec<&str> = acls.iter().copied().filter(|acl| !acl.is_empty()).collect();
+    if !acls.is_empty() {
+        nic.insert("security.acls".to_string(), acls.join(","));
         nic.insert(
             "security.acls.default.egress.action".to_string(),
             "reject".to_string(),
@@ -844,7 +842,7 @@ fn max_processes(template: &DriverSandboxTemplate) -> Option<u32> {
 /// an optional GPU device.
 pub fn build_create_devices(
     placement: Placement<'_>,
-    egress_acl: Option<&str>,
+    acls: &[&str],
     gpu: bool,
     supervisor_pool: &str,
     supervisor_volume: &str,
@@ -859,10 +857,7 @@ pub fn build_create_devices(
     root.insert("path".to_string(), "/".to_string());
     devices.insert("root".to_string(), root);
 
-    devices.insert(
-        "eth0".to_string(),
-        sandbox_nic(placement.network, egress_acl),
-    );
+    devices.insert("eth0".to_string(), sandbox_nic(placement.network, acls));
 
     let mut supervisor = HashMap::new();
     supervisor.insert("type".to_string(), "disk".to_string());
@@ -1086,7 +1081,7 @@ mod tests {
     fn build_create_devices_omits_gpu_by_default() {
         let devices = build_create_devices(
             DEFAULTS,
-            None,
+            &[],
             false,
             "default",
             "vol1",
@@ -1105,7 +1100,7 @@ mod tests {
     fn build_create_devices_attaches_gpu_when_requested() {
         let devices = build_create_devices(
             DEFAULTS,
-            None,
+            &[],
             true,
             "default",
             "vol1",
@@ -1125,7 +1120,7 @@ mod tests {
         let dhcp_vol_name = dhcp_client_volume_name(digest);
         let devices = build_create_devices(
             DEFAULTS,
-            None,
+            &[],
             false,
             "custom-pool",
             &sup_vol_name,
@@ -2558,7 +2553,7 @@ mod tests {
             storage_pool: "fast",
         };
 
-        let devices = build_create_devices(placement, None, false, "fast", "sup", "fast", "dhcp");
+        let devices = build_create_devices(placement, &[], false, "fast", "sup", "fast", "dhcp");
 
         let root = devices.get("root").expect("root device");
         assert_eq!(root.get("pool").map(String::as_str), Some("fast"));
@@ -2569,15 +2564,18 @@ mod tests {
         assert!(!eth0.keys().any(|key| key.starts_with("security.acls")));
     }
 
+    /// A sandbox's NIC carries two ACLs: the one its network shares, and the
+    /// one that is its own. LXD takes them comma-separated, and the defaults
+    /// stay `reject` in both directions whichever it is.
     #[test]
-    fn egress_acl_guards_the_nic_both_ways() {
+    fn a_nic_carries_both_acls_and_rejects_by_default() {
         let placement = Placement {
             network: "sandboxes",
             storage_pool: "local",
         };
         let devices = build_create_devices(
             placement,
-            Some("openshell-egress-sandboxes"),
+            &["openshell-egress-sandboxes", "openshell-sbp-abc123"],
             false,
             "local",
             "sup",
@@ -2587,12 +2585,33 @@ mod tests {
 
         let eth0 = devices.get("eth0").expect("eth0 device");
         for (key, value) in [
-            ("security.acls", "openshell-egress-sandboxes"),
+            (
+                "security.acls",
+                "openshell-egress-sandboxes,openshell-sbp-abc123",
+            ),
             ("security.acls.default.egress.action", "reject"),
             ("security.acls.default.ingress.action", "reject"),
         ] {
             assert_eq!(eth0.get(key).map(String::as_str), Some(value), "{key}");
         }
+
+        // The companion sits behind the same pair: it is no more entitled to
+        // the LAN than the workload it supervises.
+        let devices = build_supervisor_devices(
+            placement,
+            &["openshell-egress-sandboxes", "openshell-sbp-abc123"],
+            "local",
+            "sup",
+            "local",
+            "dhcp",
+        );
+        assert_eq!(
+            devices
+                .get("eth0")
+                .and_then(|nic| nic.get("security.acls"))
+                .map(String::as_str),
+            Some("openshell-egress-sandboxes,openshell-sbp-abc123")
+        );
     }
 
     #[test]

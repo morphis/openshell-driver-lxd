@@ -42,6 +42,17 @@ const SETTLE_DELAY: Duration = Duration::from_secs(3);
 /// See [`LxdComputeDriver::confirm_runtime_restart`].
 const RUNTIME_RESTART_SETTLE: Duration = Duration::from_millis(2250);
 
+/// The two ACLs one sandbox owns.
+///
+/// `protocol` is carried by both halves and is the whole of what the workload
+/// is allowed: inbound Sandbox Protocol and, with the NIC defaults at
+/// `reject`, nothing outbound at all. `egress` is carried by the companion
+/// alone and holds what only it may do.
+struct SandboxAcls {
+    protocol: String,
+    egress: String,
+}
+
 /// Returns true if `err` indicates the instance was already stopped.
 ///
 /// Covers both cases: LXD rejects the stop request synchronously with a
@@ -298,6 +309,7 @@ impl LxdComputeDriver {
         tracing::debug!(
             images = lxd.images,
             volumes = lxd.volumes,
+            acls = lxd.acls,
             host_entries,
             "clean-up finished"
         );
@@ -824,8 +836,8 @@ impl LxdComputeDriver {
         // Not optional since OpenShell v0.1.0: this ACL is the sandbox's outer
         // network fence, and both halves of a sandbox refuse to run without
         // one. See `isolation::LxdFenceEvidence::project`.
-        let egress_acl = self
-            .ensure_egress_acl(placement.network, &network, &gateway_endpoint)
+        let fence_acl = self
+            .ensure_network_egress_acl(placement.network, &network)
             .await?;
         // RFC 0012: the gateway mints the credentials both halves authenticate
         // with. The driver splits them; it never invents them.
@@ -849,7 +861,7 @@ impl LxdComputeDriver {
         );
         config.insert(
             mapping::KEY_EGRESS_ACL.to_string(),
-            crate::egress::acl_name(placement.network),
+            crate::egress::sandbox_protocol_acl_name(&sandbox.name),
         );
         config.insert(
             mapping::KEY_NETWORK_TYPE.to_string(),
@@ -905,6 +917,33 @@ impl LxdComputeDriver {
             .await?;
 
         let volume_use = self.volume_use.read().await;
+
+        // ...and the ACL that is this sandbox's alone, carrying its gateway
+        // and the Sandbox Protocol between its two halves.
+        //
+        // Created under `volume_use`, and not earlier, for the same reason the
+        // auxiliary volumes are: clean-up removes a per-sandbox ACL that
+        // nothing uses, and an ACL that has been created but not yet attached
+        // to an instance is exactly that. Without the lock a clean-up landing
+        // in the window between the two deletes the ACL the create is about to
+        // name, and LXD rejects the instance with "Network ACL ... does not
+        // exist". The window is small and the clean-up interval is long, which
+        // is what makes this the kind of race that passes every test and then
+        // fails a suite.
+        let sandbox_acls = self
+            .ensure_sandbox_acls(&sandbox.name, &gateway_endpoint)
+            .await?;
+        // The halves are not given the same thing. The workload carries only
+        // the protocol ACL, so with both NIC defaults at `reject` it has no
+        // egress at all — its traffic is relayed by the companion, and the
+        // fence has to hold if the in-guest boundary is ever escaped. The
+        // companion carries what it needs to do that relaying.
+        let workload_acls = [sandbox_acls.protocol.as_str()];
+        let companion_acls = [
+            fence_acl.as_str(),
+            sandbox_acls.protocol.as_str(),
+            sandbox_acls.egress.as_str(),
+        ];
 
         // Ensure digest-keyed custom storage volume exists on the aux pool.
         // Locks are keyed by pool *and* digest: the same binary on two pools
@@ -963,7 +1002,7 @@ impl LxdComputeDriver {
 
         let devices = mapping::build_create_devices(
             placement,
-            Some(egress_acl.as_str()),
+            &workload_acls,
             gpu.is_some(),
             aux_pool,
             &volume_name,
@@ -986,30 +1025,48 @@ impl LxdComputeDriver {
             .await?;
         self.wait_operation(&op.id).await?;
 
-        // 2. Resolve the workload's immutable identity and stage the RFC 0012
-        //    boundary bootstrap. The identity comes from the pinned image's own
-        //    account database, read out of the created-but-stopped instance.
-        let identity = self
-            .resolve_workload_identity(&sandbox.name, spec, &image_alias)
-            .await?;
-        let fence = isolation::LxdFenceEvidence {
-            instance_name: sandbox.name.clone(),
-            network: placement.network.to_string(),
-            network_type: network.type_.to_string(),
-            egress_acl: egress_acl.clone(),
-            unexpected_networks: self
-                .unexpected_networks(&sandbox.name, placement.network)
-                .await?,
+        // Everything from here to the companion's creation runs inside a
+        // block whose failure deletes the workload. Without it a create that
+        // fails after step 1 — `resolve_workload_identity` refusing a policy
+        // account the image does not define is the ordinary case, not an
+        // exotic one — leaves an instance carrying the sandbox id, visible
+        // for ever as Provisioning, and a retry of the same name gets a 409.
+        let staged = async {
+            // 2. Resolve the workload's immutable identity and stage the RFC 0012
+            //    boundary bootstrap. The identity comes from the pinned image's own
+            //    account database, read out of the created-but-stopped instance.
+            let identity = self
+                .resolve_workload_identity(&sandbox.name, spec, &image_alias)
+                .await?;
+            let fence = self
+                .collect_fence_evidence(
+                    &sandbox.name,
+                    placement.network,
+                    &network.type_.to_string(),
+                    &sandbox_acls.protocol,
+                )
+                .await?;
+            let artifacts = isolation::BoundaryArtifacts::new(
+                &sandbox.id,
+                &launch,
+                identity,
+                &fence,
+                Self::resource_claims(&sandbox.name, self.lxd.project(), &image_alias),
+                Self::host_gateway_ip(&Self::resolve_gateway_addresses(&gateway_endpoint).await?),
+            )?;
+            let workload_guest_files = artifacts.workload_files(&launch, child_env)?;
+            Ok::<_, DriverError>((artifacts, workload_guest_files))
+        }
+        .await;
+        let (artifacts, workload_guest_files) = match staged {
+            Ok(staged) => staged,
+            Err(e) => {
+                self.delete_instance_and_wait(&sandbox.name).await;
+                self.delete_sandbox_acl(&sandbox.name).await;
+                drop(volume_use);
+                return Err(e);
+            }
         };
-        let artifacts = isolation::BoundaryArtifacts::new(
-            &sandbox.id,
-            &launch,
-            identity,
-            &fence,
-            Self::resource_claims(&sandbox.name, self.lxd.project(), &image_alias),
-        )?;
-        let workload_guest_files = artifacts.workload_files(&launch, child_env)?;
-
         // 3. Configure and create companion supervisor instance
         let sup_name = mapping::supervisor_instance_name(&sandbox.name);
         let mut sup_config = mapping::build_supervisor_config(
@@ -1045,7 +1102,7 @@ impl LxdComputeDriver {
 
         let sup_devices = mapping::build_supervisor_devices(
             placement,
-            Some(egress_acl.as_str()),
+            &companion_acls,
             aux_pool,
             &volume_name,
             aux_pool,
@@ -1079,6 +1136,7 @@ impl LxdComputeDriver {
                 self.delete_instance_and_wait(&companion.name).await;
             }
             self.delete_instance_and_wait(&sandbox.name).await;
+            self.delete_sandbox_acl(&sandbox.name).await;
             drop(volume_use);
             return Err(e);
         }
@@ -1124,7 +1182,9 @@ impl LxdComputeDriver {
                     let _ = self.wait_operation(&op.id).await;
                 }
                 let op = self.lxd.delete_instance(&sandbox.name).await?;
-                self.wait_operation(&op.id).await
+                self.wait_operation(&op.id).await?;
+                self.delete_sandbox_acl(&sandbox.name).await;
+                Ok::<(), DriverError>(())
             };
             if let Err(cleanup_err) = cleanup.await {
                 tracing::warn!(
@@ -1302,28 +1362,118 @@ impl LxdComputeDriver {
         ])
     }
 
-    /// Lists managed networks the workload is attached to beyond its own.
+    /// Reads the outer fence off the instance LXD actually created.
     ///
-    /// Read back from the created instance's expanded devices rather than
-    /// assumed from the request, so a profile that added a second NIC shows up
-    /// in the fence evidence instead of being silently attested away.
-    async fn unexpected_networks(
+    /// Every field is an observation, never a restatement of what the create
+    /// asked for: whether the ACL is on the NIC, what the NIC's default
+    /// actions are, and what else it is attached to. The ACL name the driver
+    /// chose says nothing about whether LXD applied it — and on the start
+    /// path there was not even a create in this process to restate.
+    ///
+    /// One read serves all of it, so the extra assurance costs no extra call.
+    async fn collect_fence_evidence(
         &self,
         name: &str,
-        expected: &str,
-    ) -> Result<Vec<String>, DriverError> {
+        network: &str,
+        network_type: &str,
+        fence_acl: &str,
+    ) -> Result<isolation::LxdFenceEvidence, DriverError> {
         let instance = self.lxd.get_instance(name).await?;
-        let mut found: Vec<String> = instance
-            .expanded_devices
-            .values()
-            .filter(|device| device.get("type").map(String::as_str) == Some("nic"))
-            .filter_map(|device| device.get("network").or_else(|| device.get("parent")))
-            .filter(|network| network.as_str() != expected)
-            .cloned()
+
+        // LXD applies a network's own `security.acls` to every NIC on it, and
+        // those never show up on the NIC device — so a fence read from the
+        // NIC alone cannot see them. Read back here for the same reason as
+        // everything else: what LXD has, not what the driver asked for.
+        let mut network_acls: Vec<String> = self
+            .lxd
+            .get_network(network)
+            .await
+            .ok()
+            .and_then(|network| network.config.get("security.acls").cloned())
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|acl| !acl.is_empty())
+            .map(str::to_string)
             .collect();
-        found.sort();
-        found.dedup();
-        Ok(found)
+        network_acls.sort();
+        network_acls.dedup();
+
+        // Sorted so two devices of the same kind are reported in a stable
+        // order: the evidence is hashed into the digest both halves compare.
+        let mut devices: Vec<(&String, &HashMap<String, String>)> =
+            instance.expanded_devices.iter().collect();
+        devices.sort_by_key(|(name, _)| *name);
+
+        // The NIC the fence is installed on, and everything else that could
+        // carry a packet off this workload without passing it.
+        let mut fenced_nic: Option<&HashMap<String, String>> = None;
+        let mut unmediated_egress_paths: Vec<String> = Vec::new();
+        for (device_name, device) in devices {
+            match device.get("type").map(String::as_str) {
+                Some("nic") => {
+                    let on_expected_network =
+                        device.get("network").map(String::as_str) == Some(network);
+                    if on_expected_network && fenced_nic.is_none() {
+                        fenced_nic = Some(device);
+                        continue;
+                    }
+                    // Any NIC beyond the fenced one, wherever it points. A
+                    // second NIC on the *same* network used to pass unnoticed,
+                    // because the check compared network names and this one
+                    // matches; so did a `nictype: p2p` NIC, which names
+                    // neither a network nor a parent and fell out of the
+                    // filter entirely. Neither carries this driver's ACL.
+                    let attachment = device
+                        .get("network")
+                        .or_else(|| device.get("parent"))
+                        .map(String::as_str)
+                        .unwrap_or("no managed network");
+                    unmediated_egress_paths.push(format!("{device_name}: nic on {attachment}"));
+                }
+                // A proxy device forwards between the host and the container
+                // itself, so it is an egress path OVN never sees and no ACL
+                // of this driver's can reject.
+                Some("proxy") => {
+                    unmediated_egress_paths.push(format!("{device_name}: proxy device"));
+                }
+                // An InfiniBand device is a host adapter handed to the
+                // container whole; whatever it carries never reaches OVN.
+                Some("infiniband") => {
+                    unmediated_egress_paths.push(format!("{device_name}: infiniband device"));
+                }
+                _ => {}
+            }
+        }
+
+        let get = |key: &str| -> String {
+            fenced_nic
+                .and_then(|device| device.get(key))
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        let mut applied_acls: Vec<String> = get("security.acls")
+            .split(',')
+            .map(str::trim)
+            .filter(|acl| !acl.is_empty())
+            .map(str::to_string)
+            .collect();
+        applied_acls.sort();
+        applied_acls.dedup();
+
+        Ok(isolation::LxdFenceEvidence {
+            instance_name: name.to_string(),
+            network: network.to_string(),
+            network_type: network_type.to_string(),
+            fence_acl: fence_acl.to_string(),
+            applied_acls,
+            network_acls,
+            default_egress_action: get("security.acls.default.egress.action"),
+            default_ingress_action: get("security.acls.default.ingress.action"),
+            unmediated_egress_paths,
+            default_deny_egress_excepts: isolation::LxdFenceEvidence::DEFAULT_DENY_EGRESS_EXCEPTS,
+        })
     }
 
     /// Starts the supervisor companion against a running workload.
@@ -1554,7 +1704,6 @@ impl LxdComputeDriver {
             // The credentials are required here. The gateway omits them only
             // when it already considers the sandbox Ready, which the status
             // check above has already returned on.
-            let had_stop_intent = instance.config.contains_key(mapping::KEY_STOP_INTENT);
             let launch = isolation::LaunchAuthentication::decode(launch_authentication)?;
             let image_alias = instance
                 .config
@@ -1569,27 +1718,52 @@ impl LxdComputeDriver {
             let identity = self
                 .resolve_workload_identity_from_instance(name, &image_alias)
                 .await?;
-            let fence = isolation::LxdFenceEvidence {
-                instance_name: name.to_string(),
-                network: network.clone(),
-                network_type: instance
-                    .config
-                    .get(mapping::KEY_NETWORK_TYPE)
-                    .cloned()
-                    .unwrap_or_default(),
-                egress_acl: instance
-                    .config
-                    .get(mapping::KEY_EGRESS_ACL)
-                    .cloned()
-                    .unwrap_or_default(),
-                unexpected_networks: self.unexpected_networks(name, &network).await?,
-            };
+            // A sandbox that comes back after the gateway moved has to
+            // reach the new address, and its own ACL is the only place that
+            // is written down. Re-ensured before the fence is read, so the
+            // evidence describes the ACL this start installed.
+            let mut host_gateway_ip = None;
+            if let Ok(lxd_network) = self.lxd.get_network(&network).await {
+                match self.resolve_gateway_endpoint(&network, &lxd_network) {
+                    Ok(endpoint) => {
+                        self.ensure_sandbox_acls(name, &endpoint).await?;
+                        host_gateway_ip = Self::host_gateway_ip(
+                            &Self::resolve_gateway_addresses(&endpoint).await?,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(sandbox = %name, %e, "could not refresh the sandbox ACL");
+                    }
+                }
+            }
+
+            // The recorded keys say what this sandbox was created with;
+            // the evidence says what its NIC carries now. A fence taken away
+            // between a stop and a start has to fail the start, not be
+            // attested from the record of the create that installed it.
+            let fence = self
+                .collect_fence_evidence(
+                    name,
+                    &network,
+                    instance
+                        .config
+                        .get(mapping::KEY_NETWORK_TYPE)
+                        .map(String::as_str)
+                        .unwrap_or_default(),
+                    instance
+                        .config
+                        .get(mapping::KEY_EGRESS_ACL)
+                        .map(String::as_str)
+                        .unwrap_or_default(),
+                )
+                .await?;
             let artifacts = isolation::BoundaryArtifacts::new(
                 &sandbox_id,
                 &launch,
                 identity,
                 &fence,
                 Self::resource_claims(name, self.lxd.project(), &image_alias),
+                host_gateway_ip,
             )?;
             // The declared environment was recorded at create; the instance's
             // own environment.* keys also carry plumbing the workload must
@@ -1774,17 +1948,15 @@ impl LxdComputeDriver {
         Ok(network)
     }
 
-    /// Brings the egress ACL for sandboxes on `network_name` up to date and
-    /// returns its name (see [`crate::egress`]).
+    /// Ensures the ACL every sandbox on `network_name` shares, and returns
+    /// its name (see [`crate::egress`]).
     ///
-    /// Done on every create, before anything slow, so a changed gateway
-    /// endpoint reaches the ACL; an ACL that is already right is not
-    /// rewritten.
-    async fn ensure_egress_acl(
+    /// Its rules are a constant, so after the first sandbox on a network this
+    /// finds it already right and writes nothing.
+    async fn ensure_network_egress_acl(
         &self,
         network_name: &str,
         network: &lxd_client::Network,
-        gateway_endpoint: &str,
     ) -> Result<String, DriverError> {
         if network.type_ != NetworkType::Ovn {
             return Err(DriverError::FailedPrecondition(format!(
@@ -1796,13 +1968,70 @@ impl LxdComputeDriver {
             )));
         }
 
+        let name = crate::egress::acl_name(network_name);
+        self.lxd
+            .ensure_network_acl(&name, crate::egress::network_rules(), Vec::new())
+            .await?;
+        Ok(name)
+    }
+
+    /// The two ACLs one sandbox owns.
+    ///
+    /// `protocol` is carried by both halves and is the whole of what the
+    /// workload is allowed; `egress` is carried by the companion alone.
+    /// Ensures this sandbox's own ACLs — the protocol ACL both halves carry,
+    /// and the egress ACL only the companion carries.
+    ///
+    /// Written on create and again on start, so a sandbox that comes back
+    /// after the gateway moved reaches the new address. Nothing else rewrites
+    /// it: it belongs to one sandbox, so one sandbox's lifecycle is the only
+    /// thing that touches it.
+    async fn ensure_sandbox_acls(
+        &self,
+        sandbox_name: &str,
+        gateway_endpoint: &str,
+    ) -> Result<SandboxAcls, DriverError> {
+        let gateway = Self::resolve_gateway_addresses(gateway_endpoint).await?;
+
+        // The protocol ACL first: the companion's egress rules name it as
+        // their subject, and LXD validates a subject against the ACLs that
+        // exist when the rule is written.
+        let protocol = crate::egress::sandbox_protocol_acl_name(sandbox_name);
+        let (egress, ingress) = crate::egress::sandbox_protocol_rules(&protocol);
+        self.lxd
+            .ensure_network_acl(&protocol, egress, ingress)
+            .await?;
+
+        let fence_acl = crate::egress::sandbox_egress_acl_name(sandbox_name);
+        self.lxd
+            .ensure_network_acl(
+                &fence_acl,
+                crate::egress::companion_egress_rules(&gateway, &protocol),
+                Vec::new(),
+            )
+            .await?;
+
+        Ok(SandboxAcls {
+            protocol,
+            egress: fence_acl,
+        })
+    }
+
+    /// Resolves the gateway endpoint to the addresses a sandbox dials.
+    ///
+    /// Used both for the ACL that permits them and for the descriptor's
+    /// `host_gateway_ip`, so the address the fence allows and the address the
+    /// supervisor's network mediation trusts cannot disagree.
+    async fn resolve_gateway_addresses(
+        gateway_endpoint: &str,
+    ) -> Result<Vec<std::net::SocketAddr>, DriverError> {
         let url = url::Url::parse(gateway_endpoint).map_err(|e| {
             DriverError::FailedPrecondition(format!(
                 "gateway endpoint {gateway_endpoint:?} is not a URL: {e}"
             ))
         })?;
         let port = url.port_or_known_default().unwrap_or(443);
-        let gateway: Vec<std::net::SocketAddr> = match url.host() {
+        let addresses: Vec<std::net::SocketAddr> = match url.host() {
             Some(url::Host::Ipv4(ip)) => vec![(ip, port).into()],
             Some(url::Host::Ipv6(ip)) => vec![(ip, port).into()],
             Some(url::Host::Domain(host)) => tokio::net::lookup_host((host, port))
@@ -1815,17 +2044,49 @@ impl LxdComputeDriver {
                 .collect(),
             None => Vec::new(),
         };
-        if gateway.is_empty() {
+        if addresses.is_empty() {
             return Err(DriverError::FailedPrecondition(format!(
                 "gateway endpoint {gateway_endpoint:?} names no address for the egress ACL"
             )));
         }
+        Ok(addresses)
+    }
 
-        let name = crate::egress::acl_name(network_name);
-        self.lxd
-            .ensure_network_acl(&name, crate::egress::rules(&gateway))
-            .await?;
-        Ok(name)
+    /// The trusted dial target for the reserved host-gateway aliases.
+    ///
+    /// Policy DNS refuses `host.openshell.internal` and its siblings on the
+    /// mediated path without one (`TrustedGatewayUnavailable`), because the
+    /// supervisor's network mediation will not resolve a reserved alias
+    /// through the workload's own resolver view. The driver is the only
+    /// component that knows the address, which is why upstream's Docker
+    /// driver derives it from its endpoint, Kubernetes takes it as operator
+    /// configuration and the VM driver hard-codes its loopback.
+    ///
+    /// IPv4 first: a sandbox's NIC gets its address by DHCP over IPv4, so
+    /// that is the family it can actually dial.
+    fn host_gateway_ip(gateway: &[std::net::SocketAddr]) -> Option<std::net::IpAddr> {
+        gateway
+            .iter()
+            .find(|address| address.is_ipv4())
+            .or_else(|| gateway.first())
+            .map(std::net::SocketAddr::ip)
+    }
+
+    /// Removes a sandbox's own ACL once both its instances are gone.
+    ///
+    /// Best-effort: LXD refuses to delete an ACL still in use, and clean-up
+    /// collects one left behind. Leaving it is harmless — it grants nothing
+    /// to a NIC that no longer exists — but it is this sandbox's, so it goes
+    /// with it.
+    async fn delete_sandbox_acl(&self, sandbox_name: &str) {
+        for name in [
+            crate::egress::sandbox_egress_acl_name(sandbox_name),
+            crate::egress::sandbox_protocol_acl_name(sandbox_name),
+        ] {
+            if let Err(e) = self.lxd.delete_network_acl(&name).await {
+                tracing::debug!(sandbox = %sandbox_name, acl = %name, %e, "could not delete the sandbox ACL");
+            }
+        }
     }
 
     /// Resolves `OPENSHELL_ENDPOINT`: `--gateway-endpoint` when set, otherwise
@@ -2032,6 +2293,9 @@ impl LxdComputeDriver {
             other => other?,
         };
         self.wait_operation(&op.id).await?;
+        // Both instances are gone, so nothing carries this sandbox's ACL any
+        // more and LXD will let it go.
+        self.delete_sandbox_acl(name).await;
         {
             let mut locks = self.lifecycle_locks.lock().await;
             if Arc::strong_count(&lifecycle_lock) <= 2 {
@@ -2100,10 +2364,7 @@ mod tests {
 
         assert_eq!(response.driver_name, "lxd");
         assert_eq!(response.driver_version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(
-            response.default_image,
-            "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-        );
+        assert_eq!(response.default_image, "nvcr.io/nvidia/base/ubuntu:24.04");
         assert!(!response.driver_reports_runtime_readiness);
         let resources = response
             .resource_capabilities
@@ -2429,7 +2690,7 @@ mod tests {
     async fn validate_sandbox_create_accepts_a_well_formed_image_reference() {
         let sandbox = sandbox_with_spec(DriverSandboxSpec {
             template: Some(DriverSandboxTemplate {
-                image: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
+                image: "nvcr.io/nvidia/base/ubuntu:24.04".to_string(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -2590,7 +2851,7 @@ mod tests {
         let _sb_empty = sandbox_with_spec(empty_spec);
         assert_eq!(
             driver.config.default_image,
-            "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+            "nvcr.io/nvidia/base/ubuntu:24.04"
         );
 
         // 2. Non-empty template.image resolves to the digest-derived alias

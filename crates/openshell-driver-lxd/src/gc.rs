@@ -49,6 +49,7 @@ const SCRATCH_PREFIXES: &[&str] = &["openshell-oci-import-", "openshell-supervis
 pub(crate) struct Collected {
     pub images: usize,
     pub volumes: usize,
+    pub acls: usize,
 }
 
 /// Whether `image`, in `project`, belongs to the driver (alias `prefix`) but
@@ -234,6 +235,8 @@ async fn collect(
         Err(e) => tracing::warn!(%e, "could not list images for clean-up"),
     }
 
+    collected.acls += collect_sandbox_acls(lxd).await;
+
     let Some(keep_volumes) = keep_volumes else {
         return collected;
     };
@@ -273,6 +276,42 @@ async fn collect(
     }
 
     collected
+}
+
+/// Removes per-sandbox ACLs nothing references any more.
+///
+/// A sandbox's own ACL goes with it on delete, but a delete that raced LXD
+/// still holding the NIC leaves one behind, and so does a driver that died
+/// mid-create. An ACL with an empty `used_by` grants nothing to anything, so
+/// removing it is safe; one still in use LXD refuses to delete anyway.
+///
+/// Only the driver's own prefix is considered, and only in its own project,
+/// so an operator's ACLs are never touched.
+async fn collect_sandbox_acls(lxd: &LxdClient) -> usize {
+    let acls = match lxd.list_network_acls().await {
+        Ok(acls) => acls,
+        Err(e) => {
+            tracing::warn!(%e, "could not list network ACLs for clean-up");
+            return 0;
+        }
+    };
+    let mut removed = 0;
+    for (name, _) in acls.into_iter().filter(|(name, used_by)| {
+        crate::egress::SANDBOX_ACL_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+            && used_by.is_empty()
+    }) {
+        match lxd.delete_network_acl(&name).await {
+            Ok(()) => {
+                tracing::info!(acl = %name, "removed a sandbox ACL nothing uses");
+                removed += 1;
+            }
+            // In use again since it was listed, or already gone.
+            Err(e) => tracing::debug!(acl = %name, %e, "could not remove sandbox ACL"),
+        }
+    }
+    removed
 }
 
 /// Removes collectable images only, leaving every volume alone.
