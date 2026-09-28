@@ -35,10 +35,33 @@ set -euo pipefail
 
 # --- Pins --------------------------------------------------------------------
 
-# The release's Python SDK, which ships the generated protobuf modules the
-# source tree lacks.
-SDK_WHEEL="openshell-${OPENSHELL_VERSION}-py3-none-any.whl"
-SDK_WHEEL_SHA256="5a31eb4e38d7b5d746956404145b7335557f9060ac7a987c65ea5af4d708b3fc"
+# The sandbox image these tests need, which is not the driver's default.
+#
+# Upstream's e2e policies name `run_as_user: sandbox` explicitly (see
+# `e2e/rust/tests/landlock.rs`), and a driver must resolve an admitted identity
+# selector against the pinned image or refuse the sandbox — upstream's own
+# Podman driver refuses it too. So the suite needs an image that defines that
+# account, and the community base image is the one that does (uid 998).
+#
+# It is deliberately not the driver's default. That image has not been rebuilt
+# since May 2026 and the `/etc/openshell/policy.yaml` it ships no longer
+# parses, which breaks a sandbox created with no policy at all. It does not
+# break these tests: every one of them supplies a policy, and the supervisor
+# only falls back to the image's own when the gateway has none.
+#
+# Assigned after openshell-env.sh is sourced, so this overrides its default;
+# `start_driver` there is what reads it.
+# shellcheck disable=SC2034  # read by the sourced openshell-env.sh
+SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e"
+
+# The version the Python SDK is installed as.
+#
+# It is built from the source tree now rather than from a release wheel, and
+# upstream's pyproject.toml derives its version with setuptools-scm, which has
+# no `.git` to read here and no configured fallback. So it is told. The value
+# only has to be a valid PEP 440 version — nothing in the suites reads it —
+# and `0.1.0-pre.11` is not one.
+SDK_VERSION="0.1.0rc11"
 
 # Python the test environment is built with. cloudpickle, which the SDK's
 # exec_python uses to ship a test's function into the sandbox, serializes the
@@ -91,7 +114,7 @@ PYTHON_TESTS="${UPSTREAM_E2E_PYTHON_TESTS:-$DEFAULT_PYTHON_TESTS}"
 SOURCE_DIR="${CACHE_DIR}/openshell-src-${OPENSHELL_SOURCE_REV}"
 E2E_TARGET_DIR="${CACHE_DIR}/upstream-e2e-target"
 UV_DIR="${CACHE_DIR}/uv-${UV_VERSION}"
-VENV_DIR="${CACHE_DIR}/upstream-e2e-venv-${OPENSHELL_VERSION}-py${SANDBOX_PYTHON_VERSION}"
+VENV_DIR="${CACHE_DIR}/upstream-e2e-venv-${OPENSHELL_SOURCE_REV}-py${SANDBOX_PYTHON_VERSION}"
 SUITE_ARTIFACTS_DIR="${ARTIFACTS_DIR}/upstream-e2e"
 SDK_GATEWAY_NAME="upstream-e2e"
 
@@ -147,16 +170,15 @@ fetch_uv() {
 setup_python() {
     [ -x "${VENV_DIR}/bin/pytest" ] && return
     fetch_uv
-    mkdir -p "$OPENSHELL_DIR"
-    fetch_release_asset "$SDK_WHEEL" "$SDK_WHEEL_SHA256"
-    local wheel="${OPENSHELL_DIR}/${SDK_WHEEL}"
+    fetch_source
 
     log "creating Python test environment"
     rm -rf "$VENV_DIR"
     UV_CACHE_DIR="${CACHE_DIR}/uv-cache" "${UV_DIR}/uv" venv --quiet \
         --python "$SANDBOX_PYTHON_VERSION" "$VENV_DIR"
     UV_CACHE_DIR="${CACHE_DIR}/uv-cache" VIRTUAL_ENV="$VENV_DIR" \
-        "${UV_DIR}/uv" pip install --quiet "$wheel" "${PYTHON_TEST_REQUIREMENTS[@]}"
+        SETUPTOOLS_SCM_PRETEND_VERSION="$SDK_VERSION" \
+        "${UV_DIR}/uv" pip install --quiet "$SOURCE_DIR" "${PYTHON_TEST_REQUIREMENTS[@]}"
 }
 
 # The CLI's gateway config and state stay in the work dir, as for the

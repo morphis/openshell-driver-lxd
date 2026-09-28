@@ -5,12 +5,12 @@
 # against an OpenShell gateway backed by this driver, in the environment
 # scripts/openshell-env.sh provides:
 #
-#   smoke               create, Ready, list, exec, delete
-#   sandbox-continuity  a running sandbox keeps its workload and a stopped one
-#                       stays stopped across a gateway and a driver restart
+#   smoke              create, inspect, exec in, delete a base sandbox
+#   sandbox-lifecycle  sandbox stop, start and deletion behaviour
 #
-# The conformance runner is not released; it is built from the newest
-# upstream revision whose CLI usage the pinned OpenShell CLI supports.
+# `openshell-conformance list` is the authority on what exists; these are what
+# v0.1.0-pre.11 registers. The runner is not released, so it is built from the
+# same pinned revision as everything else it drives.
 #
 # Usage: scripts/conformance.sh
 #
@@ -22,15 +22,17 @@ set -euo pipefail
 # shellcheck source=scripts/openshell-env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/openshell-env.sh"
 
-# `openshell-conformance` first appeared after v0.0.116. The next upstream
-# change to it (33bbda3) moved `sandbox list` to `--page-size`, which the
-# v0.0.116 CLI does not have, so this is the newest revision it can drive.
-CONFORMANCE_REV="ddc8bba9677ed8413849c8f148364df2f0146a6d"
+# The conformance CLI comes from the same revision as everything else it
+# drives. It used to be pinned separately: `openshell-conformance` appeared
+# after v0.0.116, so it had to be newer than the release under test, and then
+# no newer than the last revision the v0.0.116 CLI could still drive. Building
+# the gateway and CLI from source removes that squeeze — there is one revision
+# now, and it is the one the driver targets.
+CONFORMANCE_REV="${OPENSHELL_SOURCE_REV}"
 
-SCENARIOS="${CONFORMANCE_SCENARIOS:-smoke sandbox-continuity}"
+SCENARIOS="${CONFORMANCE_SCENARIOS:-smoke sandbox-lifecycle}"
 CONFORMANCE_BIN="${CACHE_DIR}/conformance-${CONFORMANCE_REV}/bin/openshell-conformance"
 SUITE_ARTIFACTS_DIR="${ARTIFACTS_DIR}/conformance"
-PLANS_DIR="${WORK_DIR}/conformance"
 
 build_conformance() {
     [ -x "$CONFORMANCE_BIN" ] && return
@@ -46,38 +48,6 @@ build_conformance() {
     rm -rf "$src"
 }
 
-write_plans() {
-    mkdir -p "$PLANS_DIR"
-    local restart_gateway restart_driver
-    restart_gateway="$(write_host_action restart-gateway)"
-    restart_driver="$(write_host_action restart-driver)"
-
-    cat >"${PLANS_DIR}/smoke.toml" <<EOF
-version = 1
-
-[[runs]]
-scenario = "smoke"
-EOF
-
-    cat >"${PLANS_DIR}/sandbox-continuity.toml" <<EOF
-version = 1
-
-[[runs]]
-scenario = "sandbox-continuity"
-workload_expectation = "reconciled"
-
-[[runs.actions]]
-name = "gateway-restart"
-command = '${restart_gateway}'
-timeout_secs = 120
-
-[[runs.actions]]
-name = "driver-restart"
-command = '${restart_driver}'
-timeout_secs = 120
-EOF
-}
-
 [ "$#" -eq 0 ] || die "usage: $0 (takes no arguments; see scripts/openshell-env.sh to manage the environment)"
 
 require_tools
@@ -85,23 +55,24 @@ fetch_openshell
 build_conformance
 
 env_up_for_suite
-write_plans
 mkdir -p "$SUITE_ARTIFACTS_DIR"
-cp "${PLANS_DIR}"/*.toml "$SUITE_ARTIFACTS_DIR/"
 echo "conformance ${CONFORMANCE_REV}" >"${SUITE_ARTIFACTS_DIR}/versions.txt"
 
+# One scenario per invocation, so a failure names itself and one scenario's
+# leftovers cannot confuse the next.
 failed=()
 for scenario in $SCENARIOS; do
     log "running ${scenario}"
     if cli_env "$CONFORMANCE_BIN" run \
         --openshell-bin "$CLI_BIN" \
-        --plan "${PLANS_DIR}/${scenario}.toml" \
         --output json \
+        "$scenario" \
         </dev/null >"${SUITE_ARTIFACTS_DIR}/${scenario}.json" 2>"${SUITE_ARTIFACTS_DIR}/${scenario}.log"; then
         log "${scenario}: passed"
     else
         log "${scenario}: FAILED (see ${SUITE_ARTIFACTS_DIR}/${scenario}.json)"
         cat "${SUITE_ARTIFACTS_DIR}/${scenario}.json" >&2 || true
+        cat "${SUITE_ARTIFACTS_DIR}/${scenario}.log" >&2 || true
         failed+=("$scenario")
     fi
 done
