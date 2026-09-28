@@ -17,10 +17,20 @@ pub const DEFAULT_LXD_SOCKET: &str = "/var/snap/lxd/common/lxd/unix.socket";
 /// Default tracing log level.
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
-/// Default sandbox image: the upstream OpenShell community `base` sandbox
-/// image. It is resolved and imported on demand through the OCI import path
-/// (like any `template.image`), so no image needs to be pre-built or
-/// pre-loaded.
+/// Default sandbox image: upstream's own default, a plain NVIDIA Ubuntu base.
+/// It is resolved and imported on demand through the OCI import path (like any
+/// `template.image`), so no image needs to be pre-built or pre-loaded.
+///
+/// This used to be `openshell-community/sandboxes/base:latest`, which upstream
+/// moved away from — `openshell_core::image::DEFAULT_SANDBOX_BASE_IMAGE` is
+/// now this, "so a fresh installation does not depend on a separately
+/// maintained image catalog". That catalog turned out to be exactly the
+/// problem: its `latest` has not been rebuilt since May 2026 and the
+/// `/etc/openshell/policy.yaml` it ships no longer parses, which the
+/// supervisor reports as "Image policy is invalid" and the sandbox never
+/// leaves Provisioning. A base image with no policy is the supported case:
+/// the supervisor falls back to the restrictive default and syncs it to the
+/// gateway as the baseline.
 ///
 /// Three images are involved in one sandbox, and they are all different:
 ///
@@ -28,7 +38,7 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 /// - [`DEFAULT_SUPERVISOR_IMAGE`] is the rootfs of the companion container;
 /// - [`DEFAULT_SANDBOX_BINARY_IMAGE`] is never run, only mined for the
 ///   `openshell-sandbox` binary the driver mounts into the workload.
-pub const DEFAULT_SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
+pub const DEFAULT_SANDBOX_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
 
 /// Default LXD project. Re-exported from `lxd_client`.
 pub use lxd_client::DEFAULT_PROJECT;

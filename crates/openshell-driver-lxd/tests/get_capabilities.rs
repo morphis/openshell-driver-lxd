@@ -29,12 +29,21 @@ async fn get_capabilities_returns_driver_info() {
 
     assert_eq!(response.driver_name, "lxd");
     assert_eq!(response.driver_version, env!("CARGO_PKG_VERSION"));
-    assert_eq!(
-        response.default_image,
-        "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-    );
+    assert_eq!(response.default_image, "nvcr.io/nvidia/base/ubuntu:24.04");
     assert!(!response.driver_reports_runtime_readiness);
-    assert!(response.resource_capabilities.is_none());
+    assert!(response.resource_capabilities.is_some());
     assert_eq!(response.rootfs_tar_staging_dir, "");
     assert_eq!(response.rootfs_tar_max_bytes, 0);
+
+    // Without these two a v0.1.0 gateway refuses the driver outright: no
+    // protocol metadata means it will not activate it at all, and an
+    // admission policy it does not recognize fails every create and start.
+    let extension = response.extension.expect("protocol metadata is reported");
+    assert_eq!(extension.protocol_version.expect("version").major, 1);
+    assert!(extension
+        .supported_capabilities
+        .contains(&"openshell.compute.contract".to_string()));
+    assert!(response
+        .resource_admission_policy
+        .starts_with("v1:{\"allow_driver_config\":false"));
 }

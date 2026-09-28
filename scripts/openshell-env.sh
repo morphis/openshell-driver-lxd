@@ -55,14 +55,19 @@ OPENSHELL_SOURCE_REV="a8f98ec09de502bad1edc5b1a903382d27b8be0e"
 SUPERVISOR_IMAGE="ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_SOURCE_REV}@sha256:79f6c249f492bb3ed8079d72fc3ae6595d03b63db800d92df63d713ebf72fe4b"
 SANDBOX_BINARY_IMAGE="ghcr.io/nvidia/openshell/sandbox:${OPENSHELL_SOURCE_REV}@sha256:62338c8f73ebfec23270c4532b1b1f77d50591764f72a5d919b4d6227abceb72"
 
-# The sandbox rootfs, pinned by index digest. Upstream publishes it only as
-# `latest` and per-commit tags, so nothing ties a build of it to an OpenShell
-# release and it moves without warning — which is how it came to ship a
-# Python two minor versions ahead of what the suites were built against, and
-# `exec_python` started dying on bytecode the sandbox could not run. Bumping
-# this means checking SANDBOX_PYTHON_VERSION in upstream-e2e.sh with it.
+# The workload rootfs, pinned by digest: upstream's own default sandbox image.
+#
+# It used to be `openshell-community/sandboxes/base`, which upstream moved
+# away from and has not rebuilt since May 2026 — its `/etc/openshell/policy.yaml`
+# no longer parses, and a sandbox booted from it never leaves Provisioning
+# ("Image policy is invalid"). A base image with no policy at all is the
+# supported case: the supervisor falls back to the restrictive default.
+#
+# Bumping this means checking SANDBOX_PYTHON_VERSION in upstream-e2e.sh with
+# it: cloudpickle ships a test's function into the sandbox as bytecode, and
+# bytecode does not survive a Python version change.
 # shellcheck disable=SC2034  # used by the suites that source this file
-SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e"
+SANDBOX_IMAGE="nvcr.io/nvidia/base/ubuntu:24.04@sha256:c280ee89f8bfcbdaba6179ad4347f60c509e841cbe63eb93002f01bf70e0819c"
 
 # --- Layout ------------------------------------------------------------------
 
@@ -354,7 +359,7 @@ start_gateway() {
         --bind-address "$ip" \
         --port "$GATEWAY_PORT" \
         --health-port "$HEALTH_PORT" \
-        --drivers lxd \
+        --compute-driver lxd \
         --compute-driver-socket "$DRIVER_SOCKET" \
         --db-url "sqlite:${WORK_DIR}/gateway.db?mode=rwc" \
         --log-level info \
