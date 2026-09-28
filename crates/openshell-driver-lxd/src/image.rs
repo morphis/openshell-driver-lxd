@@ -135,10 +135,16 @@ const MKSQUASHFS_MEM: &str = "512M";
 /// low-port binds for the boundary's DNS relay, and keeps the boundary's own
 /// files in a directory it owns so it can delete its one-use bootstrap.
 ///
+/// Revisions 6 to 9 are deliberately skipped. Pre-release builds of this work
+/// used them for conversions that differ from what revision 10 produces, so a
+/// host that converted an image under one of those must not reuse it;
+/// advancing past them all is what makes that impossible rather than
+/// unlikely.
+///
 /// The init script is baked into the converted image, so any change to
 /// `assets/openshell-init.sh` needs a bump here: without one, hosts that
 /// already converted an image keep booting the old script.
-pub const CONVERSION_REVISION: u32 = 5;
+pub const CONVERSION_REVISION: u32 = 10;
 
 /// Returns the deterministic LXD cache alias for the given content digest.
 ///
@@ -1446,8 +1452,8 @@ mod tests {
         let digest_body = "ab".repeat(32);
         let digest = format!("sha256:{digest_body}");
         let alias = cache_alias(&digest);
-        assert_eq!(alias, format!("openshell-oci-r5-{digest_body}"));
-        assert_eq!(alias.len(), "openshell-oci-r5-".len() + 64);
+        assert_eq!(alias, format!("openshell-oci-r10-{digest_body}"));
+        assert_eq!(alias.len(), "openshell-oci-r10-".len() + 64);
     }
 
     /// Values observed from `umoci unpack --rootless` (umoci 0.4.7).
