@@ -43,11 +43,16 @@ pub enum DriverError {
     /// DHCP client binary was not found or could not be read.
     #[error("DHCP client error: {0}")]
     DhcpClient(String),
+
+    /// An internal driver failure.
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 impl From<DriverError> for Status {
     fn from(err: DriverError) -> Self {
         match err {
+            DriverError::Internal(msg) => Status::internal(msg),
             DriverError::Unimplemented(msg) => Status::unimplemented(msg),
             DriverError::InvalidArgument(msg) => Status::invalid_argument(msg),
             DriverError::FailedPrecondition(msg) => Status::failed_precondition(msg),

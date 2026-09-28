@@ -20,9 +20,114 @@ const KEY_WORKSPACE: &str = "user.openshell.workspace";
 const LABEL_PREFIX: &str = "user.openshell.label.";
 const ENV_PREFIX: &str = "environment.";
 
-/// Identifies the guest-side path where the token file is bind-mounted.
-/// The supervisor finds it via `OPENSHELL_SANDBOX_TOKEN_FILE`.
-pub(crate) const GUEST_SANDBOX_TOKEN_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
+/// Which half of a sandbox an instance is.
+///
+/// A sandbox is two LXD instances from OpenShell v0.1.0 on, and only the
+/// workload is a sandbox as far as the gateway is concerned. Every driver
+/// query filters the companion out by this key, so a caller still sees one
+/// sandbox per sandbox.
+pub(crate) const KEY_ROLE: &str = "user.openshell.role";
+pub(crate) const ROLE_WORKLOAD: &str = "workload";
+pub(crate) const ROLE_SUPERVISOR: &str = "supervisor";
+
+/// On a companion, the workload instance it supervises.
+pub(crate) const KEY_WORKLOAD_INSTANCE: &str = "user.openshell.workload_instance";
+
+/// Environment variable the init script reads to know which half it is
+/// booting. Driver-private: it is not part of any OpenShell contract, and the
+/// workload container never carries it.
+pub(crate) const ENV_ROLE: &str = "OPENSHELL_ROLE";
+
+/// What a sandbox was created with, recorded so a later start can rebuild the
+/// same launch artifacts without the create request.
+///
+/// Start-from-stopped gets a fresh session and therefore a fresh descriptor,
+/// bootstrap and fence, all of which describe the instance as it was created.
+/// The gateway does not resend the create request, so the driver keeps what it
+/// cannot otherwise recover.
+pub(crate) const KEY_NETWORK: &str = "user.openshell.network";
+pub(crate) const KEY_NETWORK_TYPE: &str = "user.openshell.network_type";
+pub(crate) const KEY_EGRESS_ACL: &str = "user.openshell.egress_acl";
+pub(crate) const KEY_IMAGE_ALIAS: &str = "user.openshell.image_alias";
+
+/// The declared environment, as JSON, for the workload's processes only.
+///
+/// It cannot be read back off the instance's own `environment.*` keys: those
+/// also carry the plumbing the in-workload boundary needs and the workload
+/// must not see.
+pub(crate) const KEY_CHILD_ENV: &str = "user.openshell.child_env";
+
+/// Suffix the companion's instance name adds to the sandbox's.
+pub(crate) const SUPERVISOR_SUFFIX: &str = "-supervisor";
+
+/// Naming convention for a sandbox's supervisor companion: `<name>-supervisor`.
+pub(crate) fn supervisor_instance_name(sandbox_name: &str) -> String {
+    format!("{sandbox_name}{SUPERVISOR_SUFFIX}")
+}
+
+/// The longest sandbox name the driver accepts.
+///
+/// LXD's own limit is 63 characters, but a sandbox is two instances and the
+/// companion's name is the sandbox's plus [`SUPERVISOR_SUFFIX`]. Validating
+/// against 63 would admit a name whose companion LXD then rejects — after the
+/// image is resolved, the volumes are provisioned and the workload is created,
+/// so the caller's error arrives late and as LXD's rather than the driver's.
+pub(crate) const MAX_SANDBOX_NAME_LEN: usize = 63 - SUPERVISOR_SUFFIX.len();
+
+/// Whether `name` is usable as an LXD instance name.
+///
+/// LXD's own rule: ASCII letters, digits and dashes, not starting with a
+/// digit or a dash, and no longer than [`MAX_SANDBOX_NAME_LEN`]. The driver
+/// checks it rather than letting LXD reject it later, because the name is
+/// interpolated into the REST paths this driver builds — a name carrying
+/// `?project=` would otherwise add a query parameter ahead of the driver's
+/// own, and LXD honours the first one, which puts the operation in another
+/// project entirely. Percent-encoding in the client closes that too; refusing
+/// the name here means a caller gets a clear error instead of a mangled
+/// instance name.
+pub(crate) fn is_valid_instance_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SANDBOX_NAME_LEN
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && !name.ends_with('-')
+}
+
+/// Whether `instance` really is `sandbox_name`'s companion.
+///
+/// [`supervisor_instance_name`] is a name a caller can ask for. Sandbox names
+/// come from the gateway, which passes the user's own
+/// (`Sandbox::object_name()`), so a sandbox called `foo-supervisor` owns the
+/// instance that `foo`'s companion would be named after. Acting on that name
+/// alone — stopping it, deleting it, folding its state into a Ready condition
+/// — would be acting on someone else's sandbox. Every companion the driver
+/// creates records both its role and the workload it belongs to, and nothing
+/// without those markers is this sandbox's to touch.
+pub(crate) fn is_companion_of(
+    instance: &Instance,
+    sandbox_name: &str,
+    sandbox_id: Option<&str>,
+) -> bool {
+    let role_and_name = instance.config.get(KEY_ROLE).map(String::as_str) == Some(ROLE_SUPERVISOR)
+        && instance
+            .config
+            .get(KEY_WORKLOAD_INSTANCE)
+            .map(String::as_str)
+            == Some(sandbox_name);
+    // The name identifies the *generation* only when the id agrees. A sandbox
+    // that was deleted and created again under the same name can leave the
+    // previous generation's companion behind — a delete whose companion stop
+    // failed does exactly that — and by role and name alone that companion
+    // belongs to the new sandbox, which would fold a stranger's state into its
+    // readiness and hand it this sandbox's stop and delete. Callers that know
+    // which generation they are asking about pass its id; those that only have
+    // a name pass `None` and get the weaker answer they asked for.
+    role_and_name
+        && match sandbox_id {
+            Some(id) => instance.config.get(KEY_SANDBOX_ID).map(String::as_str) == Some(id),
+            None => true,
+        }
+}
 
 /// Identifies the guest-side Unix socket path where the supervisor binds its
 /// SSH relay listener. The supervisor reads it via `OPENSHELL_SSH_SOCKET_PATH`.
@@ -339,72 +444,67 @@ fn lxc_target(instance: &Instance) -> String {
     }
 }
 
-/// Builds the LXD instance `config` map for `POST /1.0/instances`.
+/// The declared environment the workload's own processes get.
 ///
-/// Sets `OPENSHELL_SANDBOX_ID`, `OPENSHELL_SANDBOX`,
-/// `OPENSHELL_SSH_SOCKET_PATH` (pointing to [`GUEST_SSH_SOCKET_PATH`]) and
-/// [`ENV_MAIN_PROCESS_SPEC`] unconditionally.
+/// `template.environment` wins over `spec.environment` on a key collision, as
+/// it does everywhere else. This is handed to the in-workload boundary in its
+/// bootstrap rather than set on the container: the boundary injects it into
+/// the processes it starts, and keeping it out of the container's environment
+/// keeps it out of the boundary's own.
+pub(crate) fn workload_child_env(
+    spec: &DriverSandboxSpec,
+    template: &DriverSandboxTemplate,
+) -> HashMap<String, String> {
+    let mut env = spec.environment.clone();
+    env.extend(template.environment.clone());
+    env
+}
+
+/// The workload container: the user's image, the boundary binary, and nothing
+/// that belongs to the trusted half.
 ///
-/// `gateway_endpoint` is the resolved `OPENSHELL_ENDPOINT` value
-/// (`http://<host-ip>:<gateway-grpc-port>`). When empty the env var is not
-/// set — the gateway is expected to supply it via `spec.environment` instead.
-///
-/// `has_token` indicates whether a sandbox JWT token will be pushed into the
-/// container (via `POST /1.0/instances/<name>/files`). When `true`, the
-/// `OPENSHELL_SANDBOX_TOKEN_FILE` env var is injected so the supervisor reads
-/// the file the driver pushes at `GUEST_SANDBOX_TOKEN_PATH` before start.
+/// Under RFC 0012 this container runs `openshell-sandbox`, which takes a
+/// single `--bootstrap` file and reads no OpenShell environment at all. The
+/// gateway endpoint, the main-process spec, the SSH relay socket and the
+/// gateway credentials are the supervisor companion's, and deliberately do not
+/// appear here — the workload is the untrusted half.
 pub fn build_create_config(
     sandbox: &DriverSandbox,
     spec: &DriverSandboxSpec,
     template: &DriverSandboxTemplate,
-    gateway_endpoint: &str,
-    has_token: bool,
     default_max_processes: u32,
+    log_level: &str,
 ) -> Result<HashMap<String, String>, DriverError> {
     let mut config = HashMap::new();
 
     config.insert(KEY_SANDBOX_ID.to_string(), sandbox.id.clone());
     config.insert(KEY_NAMESPACE.to_string(), sandbox.namespace.clone());
     config.insert(KEY_WORKSPACE.to_string(), sandbox.workspace.clone());
-    // template.environment takes precedence over spec.environment on key
-    // collision, plus the two driver-injected vars the supervisor needs to
-    // reach the gateway.
-    for (key, value) in &spec.environment {
-        config.insert(format!("{ENV_PREFIX}{key}"), value.clone());
-    }
-    for (key, value) in &template.environment {
-        config.insert(format!("{ENV_PREFIX}{key}"), value.clone());
-    }
+    config.insert(KEY_ROLE.to_string(), ROLE_WORKLOAD.to_string());
+    // The guest API is a host daemon surface the workload has no use for: it
+    // exposes the instance's own `user.*` configuration and lets a guest push
+    // state back. The companion keeps it; the untrusted half does not get it.
+    config.insert("security.devlxd".to_string(), "false".to_string());
+    // Pinned on the instance, not merely refused on the profiles a caller
+    // names. Instance config overrides profile config, and a profile the
+    // driver does not scan — the project's `default`, which every instance
+    // gets — could otherwise carry either of these and silently take away the
+    // user namespace the whole confinement rests on. The driver turns nesting
+    // back on below when `--sandbox-nesting` asks for it; privileged has no
+    // such switch.
+    config.insert("security.privileged".to_string(), "false".to_string());
+    config.insert("security.nesting".to_string(), "false".to_string());
+    // The init script uses this to set the container's hostname; the boundary
+    // itself takes everything it needs from its bootstrap file.
     config.insert(
         format!("{ENV_PREFIX}OPENSHELL_SANDBOX_ID"),
         sandbox.id.clone(),
     );
     config.insert(
-        format!("{ENV_PREFIX}OPENSHELL_SANDBOX"),
-        sandbox.name.clone(),
+        format!("{ENV_PREFIX}OPENSHELL_LOG_LEVEL"),
+        log_level.to_string(),
     );
-    config.insert(
-        format!("{ENV_PREFIX}OPENSHELL_SSH_SOCKET_PATH"),
-        GUEST_SSH_SOCKET_PATH.to_string(),
-    );
-    // Without this the supervisor runs its default shell instead of the
-    // command the sandbox was created with.
-    config.insert(
-        format!("{ENV_PREFIX}{ENV_MAIN_PROCESS_SPEC}"),
-        main_process_spec(spec),
-    );
-    if !gateway_endpoint.is_empty() {
-        config.insert(
-            format!("{ENV_PREFIX}OPENSHELL_ENDPOINT"),
-            gateway_endpoint.to_string(),
-        );
-    }
-    if has_token {
-        config.insert(
-            format!("{ENV_PREFIX}OPENSHELL_SANDBOX_TOKEN_FILE"),
-            GUEST_SANDBOX_TOKEN_PATH.to_string(),
-        );
-    }
+    let _ = spec;
 
     for (key, value) in &template.labels {
         if !is_valid_label_key(key) {
@@ -450,6 +550,213 @@ pub fn build_create_config(
     Ok(config)
 }
 
+/// The supervisor companion container: the trusted half of a sandbox.
+///
+/// It runs `openshell-supervisor`, holds the gateway credentials and the
+/// canonical main-process spec, and dials the workload's boundary over the
+/// transport its backend descriptor names. The descriptor is pushed later, by
+/// the driver, because it carries an address DHCP only assigns once the
+/// workload is up.
+pub fn build_supervisor_config(
+    sandbox: &DriverSandbox,
+    spec: &DriverSandboxSpec,
+    gateway_endpoint: &str,
+    log_level: &str,
+) -> HashMap<String, String> {
+    let mut config = HashMap::new();
+    config.insert(KEY_SANDBOX_ID.to_string(), sandbox.id.clone());
+    config.insert(KEY_NAMESPACE.to_string(), sandbox.namespace.clone());
+    config.insert(KEY_WORKSPACE.to_string(), sandbox.workspace.clone());
+    config.insert(KEY_ROLE.to_string(), ROLE_SUPERVISOR.to_string());
+    config.insert(KEY_WORKLOAD_INSTANCE.to_string(), sandbox.name.clone());
+    // Which half the init script is booting. The two take different binaries
+    // and different arguments, and neither accepts the other's; the workload
+    // leaves this unset and the script's default branch is its one.
+    config.insert(
+        format!("{ENV_PREFIX}{ENV_ROLE}"),
+        ROLE_SUPERVISOR.to_string(),
+    );
+    config.insert(
+        format!("{ENV_PREFIX}OPENSHELL_SANDBOX_ID"),
+        sandbox.id.clone(),
+    );
+    config.insert(
+        format!("{ENV_PREFIX}OPENSHELL_SANDBOX"),
+        sandbox.name.clone(),
+    );
+    config.insert(
+        format!("{ENV_PREFIX}OPENSHELL_SSH_SOCKET_PATH"),
+        GUEST_SSH_SOCKET_PATH.to_string(),
+    );
+    // Without this the supervisor runs its default shell instead of the
+    // command the sandbox was created with.
+    config.insert(
+        format!("{ENV_PREFIX}{ENV_MAIN_PROCESS_SPEC}"),
+        main_process_spec(spec),
+    );
+    config.insert(
+        format!("{ENV_PREFIX}OPENSHELL_LOG_LEVEL"),
+        log_level.to_string(),
+    );
+    // Told out of band rather than read from the descriptor: upstream verifies
+    // the descriptor *against* the admitted backend, and taking both from one
+    // file would make that check self-referential.
+    config.insert(
+        format!(
+            "{ENV_PREFIX}{}",
+            crate::isolation::ENV_ADMITTED_ISOLATION_BACKEND
+        ),
+        crate::isolation::BACKEND_NAME.to_string(),
+    );
+    if !gateway_endpoint.is_empty() {
+        config.insert(
+            format!("{ENV_PREFIX}OPENSHELL_ENDPOINT"),
+            gateway_endpoint.to_string(),
+        );
+    }
+    config
+}
+
+/// Devices for the supervisor companion.
+///
+/// It sits on the same network, behind the same egress ACL, as the workload it
+/// supervises: it has to reach both the gateway and the workload's boundary,
+/// and it is no more entitled to the LAN than the workload is.
+pub fn build_supervisor_devices(
+    placement: Placement<'_>,
+    egress_acl: Option<&str>,
+    supervisor_pool: &str,
+    supervisor_volume: &str,
+    dhcp_client_pool: &str,
+    dhcp_client_volume: &str,
+) -> HashMap<String, HashMap<String, String>> {
+    let mut devices = HashMap::new();
+
+    let mut root = HashMap::new();
+    root.insert("type".to_string(), "disk".to_string());
+    root.insert("pool".to_string(), placement.storage_pool.to_string());
+    root.insert("path".to_string(), "/".to_string());
+    devices.insert("root".to_string(), root);
+
+    devices.insert(
+        "eth0".to_string(),
+        sandbox_nic(placement.network, egress_acl),
+    );
+
+    let mut supervisor = HashMap::new();
+    supervisor.insert("type".to_string(), "disk".to_string());
+    supervisor.insert("pool".to_string(), supervisor_pool.to_string());
+    supervisor.insert("source".to_string(), supervisor_volume.to_string());
+    supervisor.insert("path".to_string(), GUEST_SUPERVISOR_BIN_DIR.to_string());
+    supervisor.insert("readonly".to_string(), "true".to_string());
+    devices.insert("supervisor".to_string(), supervisor);
+
+    let mut dhcp_client = HashMap::new();
+    dhcp_client.insert("type".to_string(), "disk".to_string());
+    dhcp_client.insert("pool".to_string(), dhcp_client_pool.to_string());
+    dhcp_client.insert("source".to_string(), dhcp_client_volume.to_string());
+    dhcp_client.insert("path".to_string(), GUEST_DHCP_CLIENT_DIR.to_string());
+    dhcp_client.insert("readonly".to_string(), "true".to_string());
+    devices.insert("dhcp-client".to_string(), dhcp_client);
+
+    devices
+}
+
+/// A sandbox NIC on `network`, fenced by `egress_acl`.
+///
+/// The default actions are what make the ACL a fence: everything the rules do
+/// not name is rejected, in both directions.
+fn sandbox_nic(network: &str, egress_acl: Option<&str>) -> HashMap<String, String> {
+    let mut nic = HashMap::new();
+    nic.insert("type".to_string(), "nic".to_string());
+    nic.insert("network".to_string(), network.to_string());
+    if let Some(acl) = egress_acl {
+        nic.insert("security.acls".to_string(), acl.to_string());
+        nic.insert(
+            "security.acls.default.egress.action".to_string(),
+            "reject".to_string(),
+        );
+        nic.insert(
+            "security.acls.default.ingress.action".to_string(),
+            "reject".to_string(),
+        );
+    }
+    nic
+}
+
+/// Folds the companion's state into the sandbox's own Ready condition.
+///
+/// A sandbox is only as ready as its trusted half: a workload whose companion
+/// is missing, stopped or erroring has no supervision, whatever the workload
+/// container itself reports. Reporting the companion's trouble as the
+/// sandbox's is what lets an operator see it at all — the companion is hidden
+/// from every other driver query.
+///
+/// It only ever *downgrades*. A companion that is running says nothing the
+/// workload has not already said.
+pub fn aggregate_companion_status(sandbox: &mut DriverSandbox, companion: Option<&Instance>) {
+    let Some(status) = sandbox.status.as_mut() else {
+        return;
+    };
+    let ready = status.conditions.iter().any(|c| c.status == "True");
+    let downgrade = |reason: &str, message: String| DriverCondition {
+        r#type: "Ready".to_string(),
+        status: "False".to_string(),
+        reason: reason.to_string(),
+        message,
+        transition_time: None,
+    };
+
+    let Some(companion) = companion else {
+        // Only meaningful while the workload claims to be ready: a workload
+        // that is already reporting why it is not running should keep saying
+        // so, and a sandbox mid-creation has no companion yet.
+        if ready {
+            status.conditions = vec![downgrade(
+                CONDITION_STARTING,
+                "supervisor companion instance does not exist".to_string(),
+            )];
+        }
+        return;
+    };
+
+    if companion.status.eq_ignore_ascii_case("Error") {
+        status.conditions = vec![downgrade(
+            "ContainerError",
+            format!(
+                "supervisor companion instance is in error state: {}",
+                companion.status
+            ),
+        )];
+    } else if companion.status.eq_ignore_ascii_case("Stopped") {
+        if !companion.config.contains_key(KEY_LAST_POWER) {
+            if ready {
+                status.conditions = vec![downgrade(
+                    CONDITION_STARTING,
+                    "supervisor companion has not started yet".to_string(),
+                )];
+            }
+        } else if companion.config.contains_key(KEY_STOP_INTENT) {
+            if ready {
+                status.conditions = vec![downgrade(
+                    CONDITION_STOPPED,
+                    "supervisor companion was stopped through the compute driver API".to_string(),
+                )];
+            }
+        } else {
+            status.conditions = vec![downgrade(
+                CONDITION_EXITED,
+                "supervisor companion stopped unexpectedly".to_string(),
+            )];
+        }
+    } else if !companion.status.eq_ignore_ascii_case("Running") && ready {
+        status.conditions = vec![downgrade(
+            CONDITION_STARTING,
+            format!("supervisor companion is not ready: {}", companion.status),
+        )];
+    }
+}
+
 /// Per-sandbox `limits.processes` override from `driver_config.max_processes`.
 fn max_processes(template: &DriverSandboxTemplate) -> Option<u32> {
     let value = template
@@ -492,21 +799,10 @@ pub fn build_create_devices(
     root.insert("path".to_string(), "/".to_string());
     devices.insert("root".to_string(), root);
 
-    let mut eth0 = HashMap::new();
-    eth0.insert("type".to_string(), "nic".to_string());
-    eth0.insert("network".to_string(), placement.network.to_string());
-    if let Some(acl) = egress_acl {
-        eth0.insert("security.acls".to_string(), acl.to_string());
-        eth0.insert(
-            "security.acls.default.egress.action".to_string(),
-            "reject".to_string(),
-        );
-        eth0.insert(
-            "security.acls.default.ingress.action".to_string(),
-            "reject".to_string(),
-        );
-    }
-    devices.insert("eth0".to_string(), eth0);
+    devices.insert(
+        "eth0".to_string(),
+        sandbox_nic(placement.network, egress_acl),
+    );
 
     let mut supervisor = HashMap::new();
     supervisor.insert("type".to_string(), "disk".to_string());
@@ -806,8 +1102,107 @@ mod tests {
         assert_eq!(GUEST_DHCP_CLIENT_DIR, "/opt/openshell/net");
     }
 
+    /// A sandbox is two instances, so the name has to leave room for the
+    /// second one. Validating against LXD's own 63 admitted a name whose
+    /// companion LXD then refused — after the image was resolved, the volumes
+    /// provisioned and the workload created, so what reached the caller was
+    /// LXD complaining about a name it never typed.
     #[test]
-    fn build_create_config_sets_ssh_socket_path() {
+    fn a_name_is_only_valid_if_its_companions_name_is_too() {
+        let longest = "a".repeat(MAX_SANDBOX_NAME_LEN);
+        assert!(is_valid_instance_name(&longest));
+        assert_eq!(supervisor_instance_name(&longest).len(), 63);
+
+        let one_too_long = "a".repeat(MAX_SANDBOX_NAME_LEN + 1);
+        assert!(!is_valid_instance_name(&one_too_long));
+        assert!(supervisor_instance_name(&one_too_long).len() > 63);
+    }
+
+    /// `foo-supervisor` is a name a user can give a sandbox, and then the
+    /// instance called that is `foo-supervisor`'s *workload* — not `foo`'s
+    /// companion. Every driver operation that reaches for a companion by
+    /// name has to tell the two apart, or deleting `foo` destroys the other
+    /// sandbox.
+    #[test]
+    fn a_sandbox_that_happens_to_hold_the_companion_name_is_not_a_companion() {
+        let workload = instance_with(
+            "Running",
+            &[
+                (KEY_SANDBOX_ID, "id-of-foo-supervisor"),
+                (KEY_ROLE, ROLE_WORKLOAD),
+            ],
+        );
+        assert!(!is_companion_of(&workload, "foo", None));
+
+        // A real companion of a *different* sandbox is not this one's either.
+        let other = instance_with(
+            "Running",
+            &[
+                (KEY_SANDBOX_ID, "id-of-bar"),
+                (KEY_ROLE, ROLE_SUPERVISOR),
+                (KEY_WORKLOAD_INSTANCE, "bar"),
+            ],
+        );
+        assert!(!is_companion_of(&other, "foo", None));
+
+        // An unmanaged instance that merely has the name is not either.
+        assert!(!is_companion_of(
+            &instance_with("Running", &[]),
+            "foo",
+            None
+        ));
+
+        let mine = instance_with(
+            "Running",
+            &[
+                (KEY_SANDBOX_ID, "id-of-foo"),
+                (KEY_ROLE, ROLE_SUPERVISOR),
+                (KEY_WORKLOAD_INSTANCE, "foo"),
+            ],
+        );
+        assert!(is_companion_of(&mine, "foo", None));
+        assert!(is_companion_of(&mine, "foo", Some("id-of-foo")));
+
+        // Same name, same role, previous generation: a companion the last
+        // sandbox called `foo` left behind is not this one's, however much
+        // its name and role agree.
+        assert!(!is_companion_of(&mine, "foo", Some("id-of-foo-the-second")));
+    }
+
+    /// The init script boots two different binaries with two different
+    /// argument sets and decides between them on this variable alone. A
+    /// companion without it would try to start the workload boundary, which
+    /// does not accept the arguments it has.
+    #[test]
+    fn only_the_companion_is_marked_as_the_supervisor_half() {
+        let sandbox = identified_sandbox();
+        let spec = DriverSandboxSpec::default();
+        let template = DriverSandboxTemplate::default();
+
+        let companion = build_supervisor_config(&sandbox, &spec, "", "info");
+        assert_eq!(
+            companion
+                .get(&format!("environment.{ENV_ROLE}"))
+                .map(String::as_str),
+            Some(ROLE_SUPERVISOR)
+        );
+        assert_eq!(
+            companion.get(KEY_ROLE).map(String::as_str),
+            Some(ROLE_SUPERVISOR)
+        );
+
+        let workload = build_create_config(&sandbox, &spec, &template, 0, "info")
+            .expect("build_create_config should succeed");
+        assert!(!workload.contains_key(&format!("environment.{ENV_ROLE}")));
+        assert_eq!(
+            workload.get(KEY_ROLE).map(String::as_str),
+            Some(ROLE_WORKLOAD)
+        );
+    }
+
+    /// The SSH relay is the companion's; the workload never binds it.
+    #[test]
+    fn the_companion_gets_the_ssh_socket_path_and_the_workload_does_not() {
         let sandbox = DriverSandbox {
             id: "sb-123".to_string(),
             name: "test-sandbox".to_string(),
@@ -816,13 +1211,15 @@ mod tests {
         let spec = DriverSandboxSpec::default();
         let template = DriverSandboxTemplate::default();
 
-        let config = build_create_config(&sandbox, &spec, &template, "", false, 0)
-            .expect("build_create_config should succeed");
-
+        let companion = build_supervisor_config(&sandbox, &spec, "", "info");
         assert_eq!(
-            config.get("environment.OPENSHELL_SSH_SOCKET_PATH"),
+            companion.get("environment.OPENSHELL_SSH_SOCKET_PATH"),
             Some(&GUEST_SSH_SOCKET_PATH.to_string())
         );
+
+        let workload = build_create_config(&sandbox, &spec, &template, 0, "info")
+            .expect("build_create_config should succeed");
+        assert!(!workload.contains_key("environment.OPENSHELL_SSH_SOCKET_PATH"));
     }
 
     /// The condition for a sandbox found already stopped, which is what most
@@ -1223,9 +1620,8 @@ mod tests {
             &identified_sandbox(),
             &DriverSandboxSpec::default(),
             &DriverSandboxTemplate::default(),
-            "",
-            false,
             0,
+            "info",
         )
         .expect("build_create_config should succeed");
 
@@ -1241,21 +1637,37 @@ mod tests {
             !config.keys().any(|key| key.starts_with("raw.")),
             "{config:?}"
         );
-        // The supervisor's namespaces, nftables fence and seccomp filter work
-        // in an unnested container; nesting is only set when asked for.
-        assert!(!config.contains_key("security.nesting"), "{config:?}");
+        // The boundary's namespaces, nftables fence and seccomp filter work
+        // in an unnested container, so nesting is pinned off here and only
+        // turned back on when `--sandbox-nesting` asks for it. Both keys are
+        // pinned rather than left unset: unset means "whatever the profiles
+        // say", and the project's `default` profile is one the driver does
+        // not get to refuse.
+        assert_eq!(
+            config.get("security.nesting").map(String::as_str),
+            Some("false"),
+            "{config:?}"
+        );
+        assert_eq!(
+            config.get("security.privileged").map(String::as_str),
+            Some("false"),
+            "{config:?}"
+        );
+        // This is the workload half, and it says so: every driver query
+        // filters companions out by this key.
+        assert_eq!(
+            config.get(KEY_ROLE).map(String::as_str),
+            Some(ROLE_WORKLOAD)
+        );
+        // The init script needs the id for the container's hostname. The
+        // sandbox *name* is the companion's business.
         assert_eq!(
             config
                 .get("environment.OPENSHELL_SANDBOX_ID")
                 .map(String::as_str),
             Some("sb-123")
         );
-        assert_eq!(
-            config
-                .get("environment.OPENSHELL_SANDBOX")
-                .map(String::as_str),
-            Some("test-sandbox")
-        );
+        assert!(!config.contains_key("environment.OPENSHELL_SANDBOX"));
     }
 
     #[test]
@@ -1269,34 +1681,42 @@ mod tests {
             ..Default::default()
         };
 
-        let config = build_create_config(&identified_sandbox(), &spec, &template, "", false, 0)
-            .expect("build_create_config should succeed");
+        let child_env = workload_child_env(&spec, &template);
 
         assert_eq!(
-            config.get("environment.SHARED").map(String::as_str),
+            child_env.get("SHARED").map(String::as_str),
             Some("from-template")
         );
+        assert_eq!(child_env.get("SPEC_ONLY").map(String::as_str), Some("spec"));
         assert_eq!(
-            config.get("environment.SPEC_ONLY").map(String::as_str),
-            Some("spec")
-        );
-        assert_eq!(
-            config.get("environment.TEMPLATE_ONLY").map(String::as_str),
+            child_env.get("TEMPLATE_ONLY").map(String::as_str),
             Some("template")
         );
+
+        // ...and it stays out of the container's own environment, which is
+        // the boundary's, not the workload's.
+        let config = build_create_config(&identified_sandbox(), &spec, &template, 0, "info")
+            .expect("build_create_config should succeed");
+        assert!(!config.contains_key("environment.SHARED"));
+        assert!(!config.contains_key("environment.SPEC_ONLY"));
     }
 
-    /// The supervisor trusts these variables to know which sandbox it is and
+    /// The companion trusts these variables to know which sandbox it is and
     /// where to reach the gateway; request-supplied environment must not be
-    /// able to redirect it.
+    /// able to redirect it. Under RFC 0012 that is structural rather than a
+    /// matter of ordering: the request's environment is handed to the boundary
+    /// for the workload's processes and never reaches either container's own.
     #[test]
-    fn driver_injected_environment_cannot_be_overridden_by_the_request() {
+    fn request_environment_cannot_redirect_either_half() {
         let hostile = env(&[
             ("OPENSHELL_SANDBOX_ID", "someone-else"),
             ("OPENSHELL_SANDBOX", "someone-else"),
             ("OPENSHELL_SSH_SOCKET_PATH", "/tmp/evil.sock"),
             ("OPENSHELL_ENDPOINT", "http://attacker:1"),
-            ("OPENSHELL_SANDBOX_TOKEN_FILE", "/tmp/evil.jwt"),
+            (
+                crate::isolation::ENV_ADMITTED_ISOLATION_BACKEND,
+                "attacker-backend",
+            ),
         ]);
         let spec = DriverSandboxSpec {
             environment: hostile.clone(),
@@ -1307,34 +1727,76 @@ mod tests {
             ..Default::default()
         };
 
-        let config = build_create_config(
+        let companion = build_supervisor_config(
             &identified_sandbox(),
             &spec,
-            &template,
             "http://10.0.0.1:17670",
-            true,
-            0,
-        )
-        .expect("build_create_config should succeed");
-
+            "info",
+        );
         let expected = [
             ("OPENSHELL_SANDBOX_ID", "sb-123"),
             ("OPENSHELL_SANDBOX", "test-sandbox"),
             ("OPENSHELL_SSH_SOCKET_PATH", GUEST_SSH_SOCKET_PATH),
             ("OPENSHELL_ENDPOINT", "http://10.0.0.1:17670"),
-            ("OPENSHELL_SANDBOX_TOKEN_FILE", GUEST_SANDBOX_TOKEN_PATH),
+            (
+                crate::isolation::ENV_ADMITTED_ISOLATION_BACKEND,
+                crate::isolation::BACKEND_NAME,
+            ),
         ];
         for (key, value) in expected {
             assert_eq!(
-                config
+                companion
                     .get(&format!("environment.{key}"))
                     .map(String::as_str),
                 Some(value),
                 "{key}"
             );
         }
+
+        let workload = build_create_config(&identified_sandbox(), &spec, &template, 0, "info")
+            .expect("build_create_config should succeed");
+
+        // The one the workload does get, and it is the driver's value.
+        assert_eq!(
+            workload
+                .get("environment.OPENSHELL_SANDBOX_ID")
+                .map(String::as_str),
+            Some("sb-123")
+        );
+        // The rest are the companion's alone and must not appear at all.
+        // Asserting they are merely not one particular hostile string would
+        // miss the other four: `/tmp/evil.sock`, `http://attacker:1` and
+        // `attacker-backend` would all have passed.
+        for key in [
+            "OPENSHELL_SANDBOX",
+            "OPENSHELL_SSH_SOCKET_PATH",
+            "OPENSHELL_ENDPOINT",
+            crate::isolation::ENV_ADMITTED_ISOLATION_BACKEND,
+        ] {
+            assert!(
+                !workload.contains_key(&format!("environment.{key}")),
+                "{key} must not reach the workload at all"
+            );
+        }
+        // And nothing the caller sent may appear under any OpenShell name.
+        for (key, value) in &workload {
+            if key.starts_with("environment.OPENSHELL_") {
+                assert!(
+                    ![
+                        "someone-else",
+                        "/tmp/evil.sock",
+                        "http://attacker:1",
+                        "attacker-backend"
+                    ]
+                    .contains(&value.as_str()),
+                    "{key} carries a caller-supplied value: {value}"
+                );
+            }
+        }
     }
 
+    /// The main-process spec now travels on the companion, which is what runs
+    /// it; the workload container never sees it.
     fn decoded_main_process(config: &HashMap<String, String>) -> serde_json::Value {
         let encoded = config
             .get(&format!("environment.{ENV_MAIN_PROCESS_SPEC}"))
@@ -1355,15 +1817,7 @@ mod tests {
             ..Default::default()
         };
 
-        let config = build_create_config(
-            &identified_sandbox(),
-            &spec,
-            &DriverSandboxTemplate::default(),
-            "",
-            false,
-            0,
-        )
-        .unwrap();
+        let config = build_supervisor_config(&identified_sandbox(), &spec, "", "info");
 
         assert_eq!(
             decoded_main_process(&config),
@@ -1385,15 +1839,7 @@ mod tests {
             await_main_process_attachment: true,
             ..Default::default()
         };
-        let config = build_create_config(
-            &identified_sandbox(),
-            &spec,
-            &DriverSandboxTemplate::default(),
-            "",
-            false,
-            0,
-        )
-        .unwrap();
+        let config = build_supervisor_config(&identified_sandbox(), &spec, "", "info");
 
         assert_eq!(
             decoded_main_process(&config),
@@ -1416,13 +1862,8 @@ mod tests {
             )]),
             ..Default::default()
         };
-        let template = DriverSandboxTemplate {
-            environment: env(&[(ENV_MAIN_PROCESS_SPEC, "{}")]),
-            ..Default::default()
-        };
 
-        let config =
-            build_create_config(&identified_sandbox(), &spec, &template, "", false, 0).unwrap();
+        let config = build_supervisor_config(&identified_sandbox(), &spec, "", "info");
 
         assert_eq!(
             decoded_main_process(&config)["command"],
@@ -1436,17 +1877,13 @@ mod tests {
             environment: env(&[("OPENSHELL_ENDPOINT", "http://from-gateway:17670")]),
             ..Default::default()
         };
-        let template = DriverSandboxTemplate::default();
 
-        let resolved = build_create_config(
+        let resolved = build_supervisor_config(
             &identified_sandbox(),
             &spec,
-            &template,
             "http://10.0.0.1:17670",
-            false,
-            0,
-        )
-        .expect("build_create_config should succeed");
+            "info",
+        );
         assert_eq!(
             resolved
                 .get("environment.OPENSHELL_ENDPOINT")
@@ -1454,46 +1891,37 @@ mod tests {
             Some("http://10.0.0.1:17670")
         );
 
-        // Empty means "not resolved": the gateway-supplied value is kept.
-        let unresolved = build_create_config(&identified_sandbox(), &spec, &template, "", false, 0)
-            .expect("build_create_config should succeed");
-        assert_eq!(
-            unresolved
-                .get("environment.OPENSHELL_ENDPOINT")
-                .map(String::as_str),
-            Some("http://from-gateway:17670")
-        );
+        // Empty means "not resolved", and leaves the companion without one.
+        // The request's own environment is the workload's and never the
+        // companion's, so it cannot stand in for a resolved endpoint.
+        let unresolved = build_supervisor_config(&identified_sandbox(), &spec, "", "info");
+        assert!(!unresolved.contains_key("environment.OPENSHELL_ENDPOINT"));
     }
 
-    /// The token is delivered as a root-only file pushed before start. It
-    /// must never be written into instance config, which any LXD API client
-    /// with read access can see.
+    /// The sandbox JWT used to be staged as a file for the combined
+    /// supervisor to read. Under RFC 0012 the gateway's launch authentication
+    /// carries the credentials instead, and nothing about the token may reach
+    /// instance config, which any LXD client with read access can see.
     #[test]
-    fn sandbox_token_is_referenced_by_file_never_embedded() {
+    fn the_sandbox_token_never_reaches_instance_config() {
         let spec = DriverSandboxSpec {
             sandbox_token: "eyJhbGciOiJFZERTQSJ9.secret-token".to_string(),
             ..Default::default()
         };
         let template = DriverSandboxTemplate::default();
 
-        let with_token = build_create_config(&identified_sandbox(), &spec, &template, "", true, 0)
-            .expect("build_create_config should succeed");
-        assert_eq!(
-            with_token
-                .get("environment.OPENSHELL_SANDBOX_TOKEN_FILE")
-                .map(String::as_str),
-            Some(GUEST_SANDBOX_TOKEN_PATH)
-        );
-        assert!(
-            with_token.values().all(|v| !v.contains("secret-token")),
-            "token leaked into instance config: {with_token:?}"
-        );
-        assert!(!with_token.contains_key("environment.OPENSHELL_SANDBOX_TOKEN"));
-
-        let without_token =
-            build_create_config(&identified_sandbox(), &spec, &template, "", false, 0)
-                .expect("build_create_config should succeed");
-        assert!(!without_token.contains_key("environment.OPENSHELL_SANDBOX_TOKEN_FILE"));
+        for config in [
+            build_create_config(&identified_sandbox(), &spec, &template, 0, "info")
+                .expect("build_create_config should succeed"),
+            build_supervisor_config(&identified_sandbox(), &spec, "", "info"),
+        ] {
+            assert!(
+                config.values().all(|v| !v.contains("secret-token")),
+                "token leaked into instance config: {config:?}"
+            );
+            assert!(!config.contains_key("environment.OPENSHELL_SANDBOX_TOKEN"));
+            assert!(!config.contains_key("environment.OPENSHELL_SANDBOX_TOKEN_FILE"));
+        }
     }
 
     #[test]
@@ -1506,9 +1934,8 @@ mod tests {
             &identified_sandbox(),
             &DriverSandboxSpec::default(),
             &template,
-            "",
-            false,
             0,
+            "info",
         )
         .expect("build_create_config should succeed");
         assert_eq!(
@@ -1530,9 +1957,8 @@ mod tests {
             &identified_sandbox(),
             &DriverSandboxSpec::default(),
             &invalid,
-            "",
-            false,
             0,
+            "info",
         )
         .expect_err("invalid label key should be rejected");
         assert!(matches!(err, DriverError::InvalidArgument(_)));
@@ -1572,9 +1998,8 @@ mod tests {
             &identified_sandbox(),
             &DriverSandboxSpec::default(),
             template,
-            "",
-            false,
             0,
+            "info",
         )
     }
 
@@ -1647,9 +2072,8 @@ mod tests {
             &identified_sandbox(),
             &DriverSandboxSpec::default(),
             &zero,
-            "",
-            false,
             4096,
+            "info",
         )
         .unwrap();
         assert!(!config.contains_key("limits.processes"));
@@ -1674,9 +2098,8 @@ mod tests {
                 &identified_sandbox(),
                 &DriverSandboxSpec::default(),
                 &template,
-                "",
-                false,
                 4096,
+                "info",
             )
             .unwrap();
             assert_eq!(
@@ -2003,12 +2426,12 @@ mod tests {
         let spec = DriverSandboxSpec::default();
         let template = DriverSandboxTemplate::default();
 
-        let config = build_create_config(&sandbox, &spec, &template, "", false, 4096)
+        let config = build_create_config(&sandbox, &spec, &template, 4096, "info")
             .expect("build_create_config should succeed");
         assert_eq!(config.get("limits.processes"), Some(&"4096".to_string()));
 
         // 0 means "leave pids.max alone".
-        let unlimited = build_create_config(&sandbox, &spec, &template, "", false, 0)
+        let unlimited = build_create_config(&sandbox, &spec, &template, 0, "info")
             .expect("build_create_config should succeed");
         assert!(!unlimited.contains_key("limits.processes"));
     }
@@ -2031,9 +2454,8 @@ mod tests {
             &DriverSandbox::default(),
             &DriverSandboxSpec::default(),
             &template,
-            "",
-            false,
             4096,
+            "info",
         )
         .expect("build_create_config should succeed");
 

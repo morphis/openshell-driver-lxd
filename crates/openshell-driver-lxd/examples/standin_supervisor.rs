@@ -24,13 +24,77 @@ use std::process::exit;
 use std::time::Duration;
 
 /// A test writes an exit code here to make the stand-in exit.
-const EXIT_FILE: &str = "/var/lib/odl-standin/exit";
+///
+/// Under `/tmp` because the boundary runs as the image's unprivileged sandbox
+/// user: anywhere root-owned, the stand-in could neither record its state nor
+/// clear a handled request, and it would silently behave as if every start
+/// were its first.
+const EXIT_FILE: &str = "/tmp/odl-standin-exit";
 
 /// Present once the stand-in has started in this sandbox at least once.
-const STARTED_MARKER: &str = "/var/lib/odl-standin/started";
+const STARTED_MARKER: &str = "/tmp/odl-standin-started";
 
 fn env_exit_code(key: &str) -> Option<i32> {
     std::env::var(key).ok()?.trim().parse().ok()
+}
+
+/// The bootstrap file, however the driver invoked this binary.
+///
+/// The companion half still gets `--bootstrap <path>`. The workload half is
+/// reached through the boundary's own privilege drop — `launch-capability-free
+/// <uid> <gid> <bootstrap> [workspace]` — because the init script must not
+/// take a `setpriv` from the workload's own image. The stand-in stands in for
+/// the boundary in both cases, so it has to read both.
+fn bootstrap_path(args: &[String]) -> Option<&String> {
+    if let Some(index) = args.iter().position(|arg| arg == "--bootstrap") {
+        return args.get(index + 1);
+    }
+    let index = args
+        .iter()
+        .position(|arg| arg == "launch-capability-free")?;
+    // <uid> <gid> <bootstrap>
+    args.get(index + 3)
+}
+
+/// Applies the bootstrap's `child_env` to this process's own environment.
+///
+/// The real in-workload boundary injects that map into the processes it
+/// starts; a sandbox's declared environment travels there and not in the
+/// container's own environment. The stand-in *is* the workload as far as these
+/// tests are concerned, so it does the same thing to itself — which is what
+/// lets a test steer it with `template.environment`, the way a request steers
+/// a real sandbox.
+fn apply_child_env(args: &[String]) {
+    let Some(bootstrap) = bootstrap_path(args) else {
+        return;
+    };
+    let Ok(contents) = std::fs::read_to_string(bootstrap) else {
+        // One-use: the real boundary deletes it after reading, and a restart
+        // that finds it gone is not an error here.
+        return;
+    };
+    // Deliberately not a JSON dependency: this example is built with the
+    // driver's own dependencies and a hand-rolled scan of one flat string map
+    // is enough for the values these tests set.
+    let Some(start) = contents.find("\"child_env\"") else {
+        return;
+    };
+    let rest = &contents[start..];
+    let Some(open) = rest.find('{') else { return };
+    let Some(close) = rest[open..].find('}') else {
+        return;
+    };
+    for entry in rest[open + 1..open + close].split(',') {
+        let Some((key, value)) = entry.split_once(':') else {
+            continue;
+        };
+        let trim = |s: &str| s.trim().trim_matches('"').to_string();
+        let (key, value) = (trim(key), trim(value));
+        if !key.is_empty() {
+            println!("odl-standin: child_env {key}={value}");
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
 }
 
 fn main() {

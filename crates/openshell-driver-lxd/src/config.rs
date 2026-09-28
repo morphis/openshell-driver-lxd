@@ -22,18 +22,32 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 /// (like any `template.image`), so no image needs to be pre-built or
 /// pre-loaded.
 ///
-/// This is deliberately *not* [`DEFAULT_SUPERVISOR_IMAGE`]: the supervisor
-/// image ships the `openshell-sandbox` binary on a minimal BusyBox rootfs and
-/// is only ever used as the *source* of that binary. It cannot serve as a
-/// sandbox rootfs — BusyBox's `ip` has no `netns` subcommand, so the
-/// supervisor's proxy mode fails to isolate and exits at boot.
+/// Three images are involved in one sandbox, and they are all different:
+///
+/// - this one is the workload's rootfs, and is the user's to choose;
+/// - [`DEFAULT_SUPERVISOR_IMAGE`] is the rootfs of the companion container;
+/// - [`DEFAULT_SANDBOX_BINARY_IMAGE`] is never run, only mined for the
+///   `openshell-sandbox` binary the driver mounts into the workload.
 pub const DEFAULT_SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
 
 /// Default LXD project. Re-exported from `lxd_client`.
 pub use lxd_client::DEFAULT_PROJECT;
 
-/// Default supervisor OCI image to extract the supervisor binary from.
-pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:latest";
+/// Default OCI image the supervisor companion container runs from.
+///
+/// Upstream's released image is distroless, so the driver injects a static
+/// busybox during conversion to run its init script. This repository's
+/// `openshell-supervisor` rock is Ubuntu-based and needs no such help — and,
+/// unlike the released image, carries the `Lxd` driver fence variant the
+/// boundary requires. See `rocks/README.md`.
+pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:0.1.0-pre.3";
+
+/// Default OCI image the `openshell-sandbox` binary is extracted from.
+///
+/// Never run as a rootfs: the driver copies `/openshell-sandbox` out of it
+/// into a digest-keyed volume and mounts that into the workload container,
+/// whose own image supplies the rootfs.
+pub const DEFAULT_SANDBOX_BINARY_IMAGE: &str = "ghcr.io/nvidia/openshell/sandbox:0.1.0-pre.3";
 
 /// Default host cache directory for extracted supervisor binaries.
 pub const DEFAULT_SUPERVISOR_CACHE_DIR: &str = "/var/cache/openshell/lxd-supervisor";
@@ -136,14 +150,23 @@ pub struct Config {
     #[arg(long)]
     pub default_storage_pool: Option<String>,
 
-    /// OCI image reference to extract the OpenShell supervisor binary from.
+    /// OCI image reference to run the OpenShell supervisor companion container from.
     #[arg(long, default_value = DEFAULT_SUPERVISOR_IMAGE)]
     pub supervisor_image: String,
 
+    /// OCI image reference to extract the OpenShell sandbox binary from.
+    #[arg(long, default_value = DEFAULT_SANDBOX_BINARY_IMAGE)]
+    pub sandbox_binary_image: String,
+
     /// Optional path to a pre-extracted OpenShell supervisor binary on the host.
-    /// When set, skips extracting the binary from the supervisor OCI image.
+    /// When set, skips extracting the binary from the sandbox binary OCI image.
     #[arg(long)]
     pub supervisor_bin: Option<PathBuf>,
+
+    /// Optional path to a pre-extracted OpenShell sandbox binary on the host.
+    /// When set, skips extracting the binary from the sandbox binary OCI image.
+    #[arg(long)]
+    pub sandbox_bin: Option<PathBuf>,
 
     /// Optional path to a DHCP client binary on the host (e.g. `udhcpc` or `busybox`).
     /// When unset, the driver searches PATH and standard system locations.
@@ -322,17 +345,6 @@ pub struct Config {
     /// unless `restricted.containers.nesting=allow`.
     #[arg(long)]
     pub sandbox_nesting: bool,
-
-    /// Confine sandbox networking with an LXD network ACL: a sandbox may
-    /// reach the gateway endpoint and public internet addresses (plus the DNS
-    /// servers its network hands out, which LXD always allows), and nothing
-    /// else — no private or otherwise non-public address, so not a LAN, LXD
-    /// host or other sandbox on such addresses — and nothing may connect to
-    /// it. The driver manages one ACL per network, `openshell-egress-<network>`,
-    /// in its project. Needs sandboxes on an OVN network, where LXD applies
-    /// ACLs to individual NICs.
-    #[arg(long)]
-    pub restrict_sandbox_egress: bool,
 
     /// PEM CA certificate sandboxes verify the gateway's certificate against.
     /// Copied into every sandbox, with --guest-tls-cert and --guest-tls-key,
@@ -531,7 +543,9 @@ mod tests {
         assert_eq!(config.default_storage_pool, None);
         assert_eq!(config.default_image, DEFAULT_SANDBOX_IMAGE);
         assert_eq!(config.supervisor_image, DEFAULT_SUPERVISOR_IMAGE);
+        assert_eq!(config.sandbox_binary_image, DEFAULT_SANDBOX_BINARY_IMAGE);
         assert!(config.supervisor_bin.is_none());
+        assert!(config.sandbox_bin.is_none());
         assert!(config.lxd_url.is_none());
         assert_eq!(config.gateway_grpc_port, DEFAULT_GATEWAY_GRPC_PORT);
         assert!(config.gateway_endpoint.is_none());

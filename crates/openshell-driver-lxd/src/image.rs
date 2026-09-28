@@ -109,6 +109,12 @@ pub fn check_registry_allowed(reference: &str, allowed: &[String]) -> Result<(),
     }
 }
 
+/// Cache size `mksquashfs` is allowed for an image conversion.
+///
+/// See the call site: the default (a quarter of physical RAM) is too much for
+/// a host that is also running the gateway and its sandboxes.
+const MKSQUASHFS_MEM: &str = "512M";
+
 /// Revision of the OCI-to-LXD conversion, part of every cache alias.
 ///
 /// Bump it whenever the conversion produces a different image for the same
@@ -119,7 +125,20 @@ pub fn check_registry_allowed(reference: &str, allowed: &[String]) -> Result<(),
 /// https gateway the way the supervisor connects to it; revision 4 drops the
 /// init script's public-resolver fallback, so a sandbox whose network offers
 /// no name server has none rather than a silent one.
-pub const CONVERSION_REVISION: u32 = 4;
+///
+/// Revision 5 is the RFC 0012 dual-container sandbox: the init script runs
+/// entirely out of the driver's own volumes — its interpreter included — and
+/// hands the in-workload boundary its bootstrap through
+/// `launch-capability-free`, which empties every capability set, sets
+/// `no_new_privs` and drops to the resolved workload identity, all of which
+/// the boundary verifies before running anything. It allows unprivileged
+/// low-port binds for the boundary's DNS relay, and keeps the boundary's own
+/// files in a directory it owns so it can delete its one-use bootstrap.
+///
+/// The init script is baked into the converted image, so any change to
+/// `assets/openshell-init.sh` needs a bump here: without one, hosts that
+/// already converted an image keep booting the old script.
+pub const CONVERSION_REVISION: u32 = 5;
 
 /// Returns the deterministic LXD cache alias for the given content digest.
 ///
@@ -856,7 +875,9 @@ impl OciImporter for SkopeoImporter {
         }
 
         // Inject the minimal init script before repacking with mksquashfs, and
-        // make it the container's init.
+        // make it the container's init. Nothing is injected *for* the script:
+        // it takes its interpreter and every program it runs from the driver's
+        // own volumes, so the image needs to provide none of them.
         inject_init_script(&rootfs_dest)?;
         install_init(&rootfs_dest)?;
 
@@ -887,6 +908,13 @@ impl OciImporter for SkopeoImporter {
                 pseudo_path.as_os_str(),
                 std::ffi::OsStr::new("-xattrs-exclude"),
                 std::ffi::OsStr::new("^user\\.rootlesscontainers$"),
+                // Bound the cache. mksquashfs defaults to a quarter of
+                // physical RAM, but it runs beside the gateway, the driver and
+                // LXD on the same host, and a sandbox create must not risk
+                // OOM-killing them. Compression is not the slow part of an
+                // import — pulling the image is.
+                std::ffi::OsStr::new("-mem"),
+                std::ffi::OsStr::new(MKSQUASHFS_MEM),
             ])
             .kill_on_drop(true)
             .output();
@@ -987,7 +1015,7 @@ impl OciImporter for SkopeoImporter {
         let target_dir = cache_dir.join(clean_digest);
         let binary_path = target_dir.join("openshell-sandbox");
 
-        if binary_path.exists() {
+        if is_valid_cached_binary(&binary_path).await {
             tracing::debug!(path = %binary_path.display(), "supervisor binary cache hit");
             return Ok((binary_path, digest));
         }
@@ -1337,7 +1365,17 @@ fn resolve_in_rootfs(rootfs: &Path, guest_path: &str) -> Result<PathBuf, DriverE
         }
     }
 
-    Ok(rootfs.join(resolved).join(file_name))
+    let resolved = rootfs.join(resolved).join(file_name);
+    // An absolute target restarts from the rootfs and `..` stops at it, so
+    // this cannot trip today. It is asserted anyway: staying inside the
+    // rootfs is the one thing this function exists for, and an edit that
+    // broke it would have the driver writing to the host.
+    if !resolved.starts_with(rootfs) {
+        return Err(DriverError::ImageImport(format!(
+            "{guest_path:?} resolves outside the image rootfs"
+        )));
+    }
+    Ok(resolved)
 }
 
 /// Makes [`GUEST_INIT_PATH`] a symlink to the injected init script, replacing
@@ -1369,13 +1407,16 @@ fn install_init(rootfs_dest: &Path) -> Result<(), DriverError> {
 mod tests {
     use super::*;
 
+    /// Golden by design: the revision is spelled out so that bumping
+    /// [`CONVERSION_REVISION`] — which invalidates every cached image on every
+    /// host — has to be a deliberate edit here too.
     #[test]
     fn cache_alias_golden() {
         let digest_body = "ab".repeat(32);
         let digest = format!("sha256:{digest_body}");
         let alias = cache_alias(&digest);
-        assert_eq!(alias, format!("openshell-oci-r4-{digest_body}"));
-        assert_eq!(alias.len(), "openshell-oci-r4-".len() + 64);
+        assert_eq!(alias, format!("openshell-oci-r5-{digest_body}"));
+        assert_eq!(alias.len(), "openshell-oci-r5-".len() + 64);
     }
 
     /// Values observed from `umoci unpack --rootless` (umoci 0.4.7).
@@ -1721,7 +1762,7 @@ mod tests {
                 .unwrap_or(&self.digest_to_return);
             let target_dir = cache_dir.join(clean);
             let binary_path = target_dir.join("openshell-sandbox");
-            if binary_path.exists() {
+            if is_valid_cached_binary(&binary_path).await {
                 return Ok((binary_path, self.digest_to_return.clone()));
             }
             std::fs::create_dir_all(&target_dir).map_err(|e| {
@@ -1773,7 +1814,9 @@ mod tests {
 
         // 1. Initial resolution is a miss -> calls importer.import once
         let res_alias = cache.resolve_alias("ubuntu:22.04").await.unwrap();
-        let expected_alias = format!("test-oci-r4-{digest_hex}");
+        // Revision-agnostic: this test is about cache hit/miss, not about
+        // which conversion revision is current.
+        let expected_alias = format!("test-oci-r{CONVERSION_REVISION}-{digest_hex}");
         assert_eq!(res_alias, expected_alias);
         assert_eq!(
             importer
@@ -1953,6 +1996,30 @@ mod tests {
             std::fs::read_to_string(&script).unwrap(),
             INIT_SCRIPT_CONTENTS
         );
+    }
+
+    /// The guarantee every destination in this module depends on.
+    #[test]
+    fn guest_paths_always_resolve_inside_the_rootfs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let rootfs = temp_dir.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("real")).unwrap();
+        std::os::unix::fs::symlink("/etc/cron.d", rootfs.join("absolute")).unwrap();
+        std::os::unix::fs::symlink("../../../../etc", rootfs.join("climbing")).unwrap();
+
+        for guest_path in [
+            "/bin/busybox",
+            "/absolute/payload",
+            "/climbing/payload",
+            "/real/../../../payload",
+        ] {
+            let resolved = resolve_in_rootfs(&rootfs, guest_path).unwrap();
+            assert!(
+                resolved.starts_with(&rootfs),
+                "{guest_path} resolved to {}",
+                resolved.display()
+            );
+        }
     }
 
     #[test]

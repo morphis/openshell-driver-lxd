@@ -33,7 +33,14 @@ use tonic::{Request, Status, Streaming};
 pub const SANDBOX_IMAGE: &str = DEFAULT_SANDBOX_IMAGE;
 
 /// The stand-in exits with the code written to this guest path.
-const STANDIN_EXIT_FILE: &str = "/var/lib/odl-standin/exit";
+/// Matches `examples/standin_supervisor.rs`; under `/tmp` so the unprivileged
+/// boundary can clear a handled request.
+const STANDIN_EXIT_FILE: &str = "/tmp/odl-standin-exit";
+
+/// The sandbox user in the upstream community base image the tests boot. The
+/// exit request is written as that user so the stand-in — which runs as it —
+/// can remove the file once handled.
+const STANDIN_UID: u32 = 998;
 
 /// Graceful stop deadline the harness gives the driver. The stand-in, like the
 /// real supervisor, ignores LXD's shutdown signal, so every stop of a running
@@ -78,6 +85,55 @@ pub fn sandbox_id(name: &str) -> String {
     format!("id-{name}")
 }
 
+/// Stand-in for the credentials the gateway mints for one launch.
+///
+/// Shaped exactly like the real `SandboxLaunchAuthentication`, because the
+/// driver splits it into the protected files both halves of the sandbox
+/// consume; only the token values are fake.
+pub fn launch_authentication(name: &str) -> Vec<u8> {
+    launch_authentication_with(name, "g0000000000000001")
+}
+
+/// [`launch_authentication`] for a named generation, so a restart can be given
+/// the fresh session RFC 0012 requires.
+pub fn launch_authentication_with(name: &str, generation: &str) -> Vec<u8> {
+    // A stable per-name UUID keeps the session id readable in failures.
+    let digest = format!(
+        "{:032x}",
+        name.bytes()
+            .fold(1u128, |a, b| a.wrapping_mul(31).wrapping_add(u128::from(b)))
+    );
+    let session_id = format!(
+        "{}-{}-{}-{}-{}",
+        &digest[0..8],
+        &digest[8..12],
+        &digest[12..16],
+        &digest[16..20],
+        &digest[20..32]
+    );
+    serde_json::json!({
+        "supervisor": {
+            "session_id": session_id,
+            "runtime_generation": generation,
+            "session_rotation": 1,
+            "auth_epoch": 1,
+            "gateway_token": "test.gateway.token",
+            "gateway_expires_at": 4_102_444_800_i64,
+            "sandbox_token": "test.sandbox.token",
+            "sandbox_expires_at": 4_102_444_800_i64,
+        },
+        "gateway_id": "openshell-test",
+        "verification_keys": [{
+            "key_id": "openshell-test",
+            "public_key_pem": Vec::from(
+                "-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----\n",
+            ),
+        }],
+    })
+    .to_string()
+    .into_bytes()
+}
+
 pub fn sandbox(name: &str) -> DriverSandbox {
     DriverSandbox {
         id: sandbox_id(name),
@@ -86,6 +142,7 @@ pub fn sandbox(name: &str) -> DriverSandbox {
         workspace: "test-workspace".to_string(),
         spec: Some(DriverSandboxSpec {
             template: Some(DriverSandboxTemplate::default()),
+            launch_authentication: launch_authentication(name),
             ..Default::default()
         }),
         status: None,
@@ -228,9 +285,14 @@ pub struct Cleanup {
 
 impl Cleanup {
     pub fn new(project: &str, names: &[&str]) -> Self {
+        let mut all_names = Vec::new();
+        for name in names {
+            all_names.push((*name).to_string());
+            all_names.push(format!("{name}-supervisor"));
+        }
         Self {
             project: project.to_string(),
-            names: names.iter().map(|n| (*n).to_string()).collect(),
+            names: all_names,
         }
     }
 }
@@ -270,6 +332,12 @@ pub struct DriverOptions {
     /// Passes `--allow-plaintext-gateway`. The stand-in supervisor never
     /// connects to a gateway, so most tests need no TLS materials.
     pub allow_plaintext_gateway: bool,
+    /// Passes `--gateway-endpoint`. Required on an OVN network, where the
+    /// driver refuses to derive one — the network's address belongs to its
+    /// virtual router. Nothing in these tests dials it: the stand-in
+    /// supervisor never connects to a gateway, and the address is here so the
+    /// sandbox's egress ACL has a gateway rule to write.
+    pub gateway_endpoint: Option<String>,
     /// Lets the driver clean up (`--cleanup-interval-secs`). Off by default:
     /// test drivers run in parallel against the same project, and one's
     /// clean-up could remove a volume another is about to attach.
@@ -287,6 +355,7 @@ impl Default for DriverOptions {
             image_work_dir: image_work_dir(),
             start_retries: 1,
             allow_plaintext_gateway: true,
+            gateway_endpoint: Some("http://127.0.0.1:17670".to_string()),
             cleanup: false,
             extra_args: Vec::new(),
         }
@@ -378,16 +447,14 @@ impl Driver {
             .arg(self.dir().join("supervisor-cache"))
             .args(["--stop-timeout-secs", &STOP_TIMEOUT_SECS.to_string()])
             .args(["--start-retries", &options.start_retries.to_string()]);
-        match &options.supervisor_image {
-            None => {
-                cmd.arg("--supervisor-bin").arg(standin_supervisor());
-            }
-            Some(image) => {
-                cmd.args(["--supervisor-image", image]);
-            }
-        }
+        let supervisor_image = options.supervisor_image.as_deref().unwrap_or(SANDBOX_IMAGE);
+        cmd.args(["--supervisor-image", supervisor_image]);
+        cmd.arg("--supervisor-bin").arg(standin_supervisor());
         if options.allow_plaintext_gateway {
             cmd.arg("--allow-plaintext-gateway");
+        }
+        if let Some(endpoint) = &options.gateway_endpoint {
+            cmd.args(["--gateway-endpoint", endpoint]);
         }
         if !options.cleanup {
             cmd.args(["--cleanup-interval-secs", "0"]);
@@ -570,17 +637,22 @@ impl Driver {
             .map(|_| ())
     }
 
+    /// Starts a stopped sandbox with the fresh launch credentials the gateway
+    /// mints for every start transition.
     pub async fn start_sandbox(&self, name: &str) -> Result<(), Status> {
+        self.start_sandbox_with(name, "g0000000000000002").await
+    }
+
+    pub async fn start_sandbox_with(&self, name: &str, generation: &str) -> Result<(), Status> {
         self.client()
             .await
             .start_sandbox(Request::new(StartSandboxRequest {
                 sandbox_id: String::new(),
                 name: name.to_string(),
-                // A gateway sends fresh launch credentials and a new
-                // generation on every start; the driver's own start path is
-                // what these tests exercise, so they send none.
-                launch_authentication: Vec::new(),
-                generation_id: String::new(),
+                launch_authentication: launch_authentication_with(name, generation),
+                generation_id: generation.to_string(),
+                // Set only by a gateway that binds a runtime identity, which
+                // this driver does not advertise.
                 expected_runtime_identity: String::new(),
             }))
             .await
@@ -618,9 +690,19 @@ impl Driver {
 
     /// Makes the sandbox's stand-in supervisor exit with `code`, as if the
     /// real supervisor had died.
+    /// World-readable on purpose: the boundary runs as the image's
+    /// unprivileged sandbox user, so a root-owned `0400` request — the default
+    /// for a pushed file — would simply be invisible to the stand-in.
     pub async fn exit_supervisor(&self, name: &str, code: i32) {
         lxd_in(&self.project)
-            .push_file_into_instance(name, STANDIN_EXIT_FILE, code.to_string().as_bytes())
+            .push_file_into_instance_as(
+                name,
+                STANDIN_EXIT_FILE,
+                code.to_string().as_bytes(),
+                STANDIN_UID,
+                STANDIN_UID,
+                "0644",
+            )
             .await
             .expect("push stand-in exit request");
     }

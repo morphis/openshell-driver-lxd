@@ -2,17 +2,24 @@
 
 //! The network ACL that confines a sandbox's egress.
 //!
-//! Inside a sandbox the supervisor already forces the workload through its
-//! policy proxy. The sandbox as a whole — the supervisor included — sits on an
-//! ordinary network, though, and could otherwise reach the LAN, the LXD host,
-//! other sandboxes and any other instance. With `--restrict-sandbox-egress`
-//! every sandbox NIC gets an LXD network ACL that allows only:
+//! Inside a sandbox the boundary already forces the workload through its
+//! policy proxy. The sandbox as a whole — its supervisor companion included —
+//! sits on an ordinary network, though, and could otherwise reach the LAN, the
+//! LXD host, other sandboxes and any other instance.
+//!
+//! Every sandbox NIC therefore gets an LXD network ACL that allows only:
 //!
 //! - the gateway endpoint (TCP to its address and port), and
 //! - public internet addresses,
 //!
 //! and rejects everything else, inbound included (replies to allowed
-//! connections are let back in by the ACL's connection tracking). DNS needs
+//! connections are let back in by the ACL's connection tracking).
+//!
+//! This is not an option. From OpenShell v0.1.0 it is the sandbox's *outer
+//! network fence*, and both the supervisor companion and the in-workload
+//! boundary refuse to run without one — see
+//! [`crate::isolation::LxdFenceEvidence::project`] for what it has to
+//! establish and why an ACL establishes it. DNS needs
 //! no rule: LXD lets an OVN NIC reach the DNS servers its network hands out
 //! whatever its ACLs say.
 //!

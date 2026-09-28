@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use computev1::pb::{
-    CpuResourceCapabilities, DriverSandbox, GetCapabilitiesResponse, GpuResourceCapabilities,
-    MemoryResourceCapabilities, ResourceCapabilities,
+    CpuResourceCapabilities, DriverSandbox, DriverSandboxSpec, GetCapabilitiesResponse,
+    GpuResourceCapabilities, MemoryResourceCapabilities, ResourceCapabilities,
 };
 use lxd_client::{LxdClient, LxdError, NetworkType};
 use tokio::sync::{Mutex, OnceCell, RwLock};
@@ -18,10 +18,15 @@ use crate::config::Config;
 use crate::dhcp_client;
 use crate::error::DriverError;
 use crate::image::{self, digest_of_file, ImageCache, SkopeoImporter};
+use crate::isolation;
 use crate::mapping;
 use crate::protocol;
 
 const DRIVER_NAME: &str = "lxd";
+
+/// How long to wait for a started workload to acquire the IPv4 address its
+/// supervisor companion dials. DHCP runs inside the container, after start.
+const BOUNDARY_ADDRESS_TIMEOUT_SECS: u64 = 60;
 
 /// How long to let a freshly started sandbox settle before checking that its
 /// init is still up. See [`LxdComputeDriver::settle_after_start`].
@@ -164,26 +169,31 @@ impl LxdComputeDriver {
     }
 
     /// The supervisor binary on the host and its digest, extracting it from
-    /// the supervisor image on first use.
+    /// the sandbox binary image on first use.
     async fn resolve_supervisor(&self) -> Result<(std::path::PathBuf, String), DriverError> {
-        match &self.config.supervisor_bin {
+        let binary_path = self
+            .config
+            .sandbox_bin
+            .as_ref()
+            .or(self.config.supervisor_bin.as_ref());
+        match binary_path {
             Some(path) => Ok((path.clone(), digest_of_file(path)?)),
-            None => self.extract_supervisor().await.map_err(|e| {
-                DriverError::ImageImport(format!("supervisor binary extraction failed: {e}"))
+            None => self.extract_sandbox_binary().await.map_err(|e| {
+                DriverError::ImageImport(format!("sandbox binary extraction failed: {e}"))
             }),
         }
     }
 
-    /// Extracts the supervisor binary from the configured image, refusing a
-    /// registry the operator has not allowed.
-    async fn extract_supervisor(&self) -> Result<(std::path::PathBuf, String), DriverError> {
+    /// Extracts the in-workload boundary binary from the configured image,
+    /// refusing a registry the operator has not allowed.
+    async fn extract_sandbox_binary(&self) -> Result<(std::path::PathBuf, String), DriverError> {
         image::check_registry_allowed(
-            &self.config.supervisor_image,
+            &self.config.sandbox_binary_image,
             &self.config.allowed_registries,
         )?;
         self.image_cache
             .extract_supervisor_binary(
-                &self.config.supervisor_image,
+                &self.config.sandbox_binary_image,
                 &self.config.supervisor_cache_dir,
             )
             .await
@@ -206,8 +216,8 @@ impl LxdComputeDriver {
         // Likewise for the DHCP client: it is resolved from the host, so
         // without its digest the volume in use cannot be told from a stale one.
         let dhcp_digest =
-            match dhcp_client::load_dhcp_client(self.config.dhcp_client_bin.as_deref()).await {
-                Ok((_, digest)) => Some(digest),
+            match dhcp_client::load_guest_net_tools(self.config.dhcp_client_bin.as_deref()).await {
+                Ok(tools) => Some(tools.digest),
                 Err(e) => {
                     tracing::warn!(%e, "could not resolve the DHCP client; keeping its volumes");
                     None
@@ -219,7 +229,25 @@ impl LxdComputeDriver {
         // Without knowing which image that is, nothing is collected by age:
         // the one image that must survive is exactly the one that cannot be
         // identified.
-        let keep_aliases: Vec<String> = self.default_image_alias().await.into_iter().collect();
+        //
+        // The supervisor image is kept for the same reason and was not: it is
+        // converted and cached under the same scheme as any other, but no
+        // create refreshes its `last_used_at` unless a sandbox happens to be
+        // made from it, so a week of idleness had the collector evict the one
+        // image every sandbox's trusted half comes from — leaving the next
+        // create to re-import it, and to need the registry to be reachable to
+        // do so.
+        let mut keep_aliases: Vec<String> = Vec::new();
+        let mut unresolved = false;
+        for image in [&self.config.default_image, &self.config.supervisor_image] {
+            match self.cache_alias_to_keep(image).await {
+                Some(alias) => keep_aliases.push(alias),
+                None => unresolved = true,
+            }
+        }
+        if unresolved {
+            keep_aliases.clear();
+        }
         let images = crate::gc::ImageRetention {
             retention: if keep_aliases.is_empty() {
                 Duration::ZERO
@@ -275,26 +303,21 @@ impl LxdComputeDriver {
         );
     }
 
-    /// The cache alias of the configured default image, resolved without
-    /// importing anything.
+    /// The cache alias for an image the driver needs on every create, or
+    /// `None` if it cannot be worked out.
     ///
-    /// Only the registry round trip that maps the reference to a digest is
-    /// needed, and a registry that is unreachable at clean-up time simply
-    /// leaves the default image unprotected for this run — the next run, or
-    /// the next create, restores it. That is why this is best-effort rather
-    /// than a failure.
-    async fn default_image_alias(&self) -> Option<String> {
-        match self
-            .image_cache
-            .cache_alias_for(&self.config.default_image)
-            .await
-        {
+    /// `None` is what stops the collector: an image that cannot be named
+    /// cannot be exempted, and collecting by age without knowing which images
+    /// must survive would evict exactly the one that must not.
+    async fn cache_alias_to_keep(&self, image: &str) -> Option<String> {
+        match self.image_cache.cache_alias_for(image).await {
             Ok(alias) => Some(alias),
             Err(e) => {
                 tracing::warn!(
-                    image = %self.config.default_image,
+                    %image,
                     %e,
-                    "could not resolve the default image; not collecting any image this run"
+                    "could not resolve an image the driver always needs; \
+                     not collecting any image this run"
                 );
                 None
             }
@@ -379,6 +402,17 @@ impl LxdComputeDriver {
                 "sandbox.id is required".into(),
             ));
         }
+        // The name becomes an LXD instance name and is interpolated into the
+        // REST paths the client builds, so it has to be one before it goes
+        // anywhere near either.
+        if !mapping::is_valid_instance_name(&sandbox.name) {
+            return Err(DriverError::InvalidArgument(format!(
+                "sandbox.name {:?} is not a usable LXD instance name: 1-{} characters, \
+                 ASCII letters, digits and dashes, starting with a letter",
+                sandbox.name,
+                mapping::MAX_SANDBOX_NAME_LEN
+            )));
+        }
         let spec = sandbox
             .spec
             .as_ref()
@@ -433,6 +467,96 @@ impl LxdComputeDriver {
             }
         }
 
+        // A profile contributes config and devices to the instance, and the
+        // instance is the untrusted half of the sandbox. Several profile keys
+        // would undo it outright: `environment.OPENSHELL_ROLE=supervisor`
+        // flips the *workload's* init into the branch that runs the
+        // supervisor image's own programs as root; `raw.lxc` can add an
+        // interface the fence evidence never sees, drop the AppArmor profile
+        // or replace the init command; `raw.idmap` maps a host uid into the
+        // container; `security.*` owns the user namespace, the syscall
+        // interceptions and the guest API. A profile may still *place* an
+        // instance; it may not reconfigure what the instance is.
+        //
+        // This is a denylist by prefix rather than by key, because the keys
+        // that matter share prefixes and new ones keep arriving; anything the
+        // driver does not recognise under those prefixes is refused rather
+        // than admitted. `security.privileged` and `security.nesting` are
+        // also pinned on the instance itself, which overrides any profile —
+        // including `default`, which a caller does not name and the driver
+        // cannot refuse.
+        for name in mapping::build_profiles(template) {
+            // Fails closed. A profile that cannot be read is a profile whose
+            // contents are unknown, and admitting it on a transient LXD error
+            // would make the whole check something an attacker can wait out.
+            // A profile that does not exist fails the create a moment later
+            // anyway, so nothing legitimate is lost by refusing here.
+            let profile = self.lxd.get_profile(&name).await.map_err(|e| {
+                DriverError::FailedPrecondition(format!(
+                    "profile {name:?} could not be read, so what it would add to the sandbox \
+                     is unknown: {e}"
+                ))
+            })?;
+            for key in profile.config.keys() {
+                if key.starts_with("environment.OPENSHELL_")
+                    || key.starts_with("raw.")
+                    || key.starts_with("security.")
+                    || key == "linux.kernel_modules"
+                {
+                    return Err(DriverError::FailedPrecondition(format!(
+                        "profile {name:?} sets {key:?}, which a sandbox's own configuration owns"
+                    )));
+                }
+            }
+
+            // `default` is exempt from the device check, and only from this
+            // one: every instance in the project gets it, it is where a
+            // deployment puts its root disk and its network, and refusing it
+            // would refuse every sandbox. What it can add is bounded by the
+            // instance's own devices, which take precedence by name, and by
+            // the fence evidence, which reads every NIC and proxy device off
+            // the created instance whatever put it there.
+            if name == "default" {
+                continue;
+            }
+            for (device, properties) in &profile.devices {
+                let kind = properties.get("type").map(String::as_str).unwrap_or("");
+                // An allowlist: a placement profile names a pool for the root
+                // disk, and that is all it needs to do. Everything else is
+                // either an egress path the fence does not cover (`nic`,
+                // `proxy`, `infiniband`) or a piece of the host handed to the
+                // untrusted half (`disk` with a `source`, `unix-char`,
+                // `unix-block`, `usb`, `pci`, `gpu`, `tpm`) — including a
+                // `disk` mounted over `/opt/openshell`, which would shadow
+                // the volumes every program on the workload's boot path comes
+                // from.
+                let placement_only = kind == "disk" && !properties.contains_key("source");
+                if !placement_only {
+                    return Err(DriverError::FailedPrecondition(format!(
+                        "profile {name:?} adds a {kind} device {device:?}; a profile may say \
+                         where a sandbox lands, but what it is attached to and what of the \
+                         host it can reach are the driver's to decide"
+                    )));
+                }
+            }
+        }
+
+        // The companion this sandbox would get is named after it, and a
+        // sandbox may already be called that: names come from the gateway,
+        // which passes the user's own. Refusing here says so plainly, rather
+        // than leaving a create to fail half way through on a name LXD
+        // reports only as taken.
+        let sup_name = mapping::supervisor_instance_name(&sandbox.name);
+        if let Ok(existing) = self.lxd.get_instance(&sup_name).await {
+            if !mapping::is_companion_of(&existing, &sandbox.name, None) {
+                return Err(DriverError::FailedPrecondition(format!(
+                    "instance {sup_name:?} already exists and is not this sandbox's \
+                     supervisor companion, which is what this sandbox's companion would \
+                     have to be called; rename the sandbox or remove {sup_name:?}"
+                )));
+            }
+        }
+
         Ok(())
     }
 
@@ -463,7 +587,10 @@ impl LxdComputeDriver {
             }) => return Err(not_found()),
             Err(e) => return Err(e.into()),
         };
-        if !instance.config.contains_key(mapping::KEY_SANDBOX_ID) {
+        if !instance.config.contains_key(mapping::KEY_SANDBOX_ID)
+            || instance.config.get(mapping::KEY_ROLE).map(String::as_str)
+                == Some(mapping::ROLE_SUPERVISOR)
+        {
             return Err(not_found());
         }
         Ok(instance)
@@ -472,21 +599,93 @@ impl LxdComputeDriver {
     pub async fn get_sandbox(&self, name: &str) -> Result<DriverSandbox, DriverError> {
         let instance = self.get_managed_instance(name).await?;
         let instance = self.confirm_runtime_restart(instance).await;
-        Ok(mapping::instance_to_driver_sandbox(&instance))
+        let mut sandbox = mapping::instance_to_driver_sandbox(&instance);
+
+        // Passed even when it is missing: a workload whose companion is gone
+        // has no supervision, and saying so is the only way that shows up at
+        // all — the companion is hidden from every other query.
+        let companion = self
+            .companion_of(
+                name,
+                instance
+                    .config
+                    .get(mapping::KEY_SANDBOX_ID)
+                    .map(String::as_str),
+            )
+            .await;
+        mapping::aggregate_companion_status(&mut sandbox, companion.as_ref());
+
+        Ok(sandbox)
+    }
+
+    /// This sandbox's companion, if it exists and really is this sandbox's.
+    ///
+    /// Resolved by name and then checked, never by name alone: see
+    /// [`mapping::is_companion_of`] for why the name is not enough. An
+    /// instance of that name belonging to something else is reported as no
+    /// companion at all, which is what it is as far as this sandbox goes.
+    async fn companion_of(
+        &self,
+        name: &str,
+        sandbox_id: Option<&str>,
+    ) -> Option<lxd_client::Instance> {
+        let sup_name = mapping::supervisor_instance_name(name);
+        let instance = self.lxd.get_instance(&sup_name).await.ok()?;
+        if mapping::is_companion_of(&instance, name, sandbox_id) {
+            return Some(instance);
+        }
+        tracing::warn!(
+            sandbox = %name,
+            instance = %sup_name,
+            "an instance holds this sandbox's companion name but is not its companion; \
+             leaving it alone"
+        );
+        None
+    }
+
+    /// Deletes an instance and waits for the deletion to finish.
+    ///
+    /// Cleanup paths have to wait rather than fire and forget: an instance
+    /// that still exists holds the sandbox's ACLs in LXD's `used_by`, and the
+    /// `delete_sandbox_acl` that follows would be refused and leave them for
+    /// the six-hourly collector. Best-effort, because the failure that
+    /// brought us here is the one worth reporting.
+    async fn delete_instance_and_wait(&self, name: &str) {
+        match self.lxd.delete_instance(name).await {
+            Ok(op) => {
+                let _ = self.wait_operation(&op.id).await;
+            }
+            Err(e) => tracing::warn!(instance = %name, %e, "failed to delete instance"),
+        }
     }
 
     pub async fn list_sandboxes(&self) -> Result<Vec<DriverSandbox>, DriverError> {
         let instances = self.lxd.list_instances().await?;
         let mut sandboxes: Vec<DriverSandbox> = Vec::new();
         let mut unsettled: Vec<usize> = Vec::new();
-        for instance in instances
-            .iter()
-            .filter(|i| i.config.contains_key(mapping::KEY_SANDBOX_ID))
-        {
+        for instance in instances.iter().filter(|i| {
+            i.config.contains_key(mapping::KEY_SANDBOX_ID)
+                && i.config.get(mapping::KEY_ROLE).map(String::as_str)
+                    != Some(mapping::ROLE_SUPERVISOR)
+        }) {
             if mapping::stopped_by_the_runtime(instance) {
                 unsettled.push(sandboxes.len());
             }
-            sandboxes.push(mapping::instance_to_driver_sandbox(instance));
+            let mut sb = mapping::instance_to_driver_sandbox(instance);
+            let sup_name = mapping::supervisor_instance_name(&instance.name);
+            let companion = instances.iter().find(|i| {
+                i.name == sup_name
+                    && mapping::is_companion_of(
+                        i,
+                        &instance.name,
+                        instance
+                            .config
+                            .get(mapping::KEY_SANDBOX_ID)
+                            .map(String::as_str),
+                    )
+            });
+            mapping::aggregate_companion_status(&mut sb, companion);
+            sandboxes.push(sb);
         }
 
         // One wait covers every sandbox that looked stopped by LXD, so a list
@@ -497,7 +696,18 @@ impl LxdComputeDriver {
                 let Ok(instance) = self.lxd.get_instance(&sandboxes[index].name).await else {
                     continue;
                 };
-                sandboxes[index] = mapping::instance_to_driver_sandbox(&instance);
+                let mut sb = mapping::instance_to_driver_sandbox(&instance);
+                let companion = self
+                    .companion_of(
+                        &instance.name,
+                        instance
+                            .config
+                            .get(mapping::KEY_SANDBOX_ID)
+                            .map(String::as_str),
+                    )
+                    .await;
+                mapping::aggregate_companion_status(&mut sb, companion.as_ref());
+                sandboxes[index] = sb;
             }
         }
         Ok(sandboxes)
@@ -536,7 +746,11 @@ impl LxdComputeDriver {
         let instances = self.lxd.list_instances().await?;
         Ok(instances
             .into_iter()
-            .find(|i| i.config.get(mapping::KEY_SANDBOX_ID).map(String::as_str) == Some(sandbox_id))
+            .find(|i| {
+                i.config.get(mapping::KEY_SANDBOX_ID).map(String::as_str) == Some(sandbox_id)
+                    && i.config.get(mapping::KEY_ROLE).map(String::as_str)
+                        != Some(mapping::ROLE_SUPERVISOR)
+            })
             .map(|i| i.name))
     }
 
@@ -556,48 +770,41 @@ impl LxdComputeDriver {
             mapping::Placement::resolve(template, &defaults.network, &defaults.storage_pool);
         let network = self.check_placement(placement).await?;
 
-        let has_token = !spec.sandbox_token.is_empty();
         let gateway_endpoint = self.resolve_gateway_endpoint(placement.network, &network)?;
-        let egress_acl = if self.config.restrict_sandbox_egress {
-            Some(
-                self.ensure_egress_acl(placement.network, &network, &gateway_endpoint)
-                    .await?,
-            )
-        } else {
-            None
-        };
+        // Not optional since OpenShell v0.1.0: this ACL is the sandbox's outer
+        // network fence, and both halves of a sandbox refuse to run without
+        // one. See `isolation::LxdFenceEvidence::project`.
+        let egress_acl = self
+            .ensure_egress_acl(placement.network, &network, &gateway_endpoint)
+            .await?;
+        // RFC 0012: the gateway mints the credentials both halves authenticate
+        // with. The driver splits them; it never invents them.
+        let launch = isolation::LaunchAuthentication::decode(&spec.launch_authentication)?;
+
         let mut config = mapping::build_create_config(
             sandbox,
             spec,
             template,
-            &gateway_endpoint,
-            has_token,
             self.config.default_max_processes,
+            &self.config.log_level,
         )?;
 
-        // Files the supervisor needs before it starts. The TLS materials are
-        // read now, before anything is created, so a missing or unreadable
-        // one fails the create without leaving an instance behind.
-        let mut guest_files = Vec::new();
-        if has_token {
-            guest_files.push((
-                mapping::GUEST_SANDBOX_TOKEN_PATH,
-                spec.sandbox_token.as_bytes().to_vec(),
-            ));
-        }
-        if self.config.guest_tls().is_some() {
-            guest_files.extend(self.read_guest_tls_files().await?);
-            mapping::insert_guest_tls_environment(&mut config);
-            if let Some(name) = &self.config.gateway_tls_server_name {
-                config.insert(
-                    "environment.OPENSHELL_GATEWAY_TLS_SERVER_NAME".to_string(),
-                    name.clone(),
-                );
-            }
-        }
         if self.config.sandbox_nesting {
             config.insert("security.nesting".to_string(), "true".to_string());
         }
+
+        config.insert(
+            mapping::KEY_NETWORK.to_string(),
+            placement.network.to_string(),
+        );
+        config.insert(
+            mapping::KEY_EGRESS_ACL.to_string(),
+            crate::egress::acl_name(placement.network),
+        );
+        config.insert(
+            mapping::KEY_NETWORK_TYPE.to_string(),
+            network.type_.to_string(),
+        );
 
         // Auxiliary volumes live on the sandbox's own pool unless the
         // operator pinned them, so a request asking for a non-default
@@ -633,6 +840,20 @@ impl LxdComputeDriver {
             self.resolve_image(&template.image).await?
         };
 
+        config.insert(mapping::KEY_IMAGE_ALIAS.to_string(), image_alias.clone());
+        let child_env = mapping::workload_child_env(spec, template);
+        config.insert(
+            mapping::KEY_CHILD_ENV.to_string(),
+            serde_json::to_string(&child_env).map_err(|e| {
+                DriverError::Internal(format!("serialize workload environment: {e}"))
+            })?,
+        );
+
+        let supervisor_image_alias = self
+            .image_cache
+            .resolve_alias(&self.config.supervisor_image)
+            .await?;
+
         let volume_use = self.volume_use.read().await;
 
         // Ensure digest-keyed custom storage volume exists on the aux pool.
@@ -658,9 +879,12 @@ impl LxdComputeDriver {
                 })?;
         }
 
-        // Ensure digest-keyed custom storage volume exists for the DHCP client
-        let (dhcp_binary_bytes, dhcp_digest) =
-            dhcp_client::load_dhcp_client(self.config.dhcp_client_bin.as_deref()).await?;
+        // Ensure digest-keyed custom storage volume exists for the guest's
+        // network tooling: the DHCP client, and the busybox the init scripts
+        // take their interpreter and their programs from.
+        let net_tools =
+            dhcp_client::load_guest_net_tools(self.config.dhcp_client_bin.as_deref()).await?;
+        let dhcp_digest = net_tools.digest;
         let dhcp_volume_name = mapping::dhcp_client_volume_name(&dhcp_digest);
         let dhcp_vol_lock = {
             let mut locks = self.dhcp_client_volume_locks.lock().await;
@@ -675,7 +899,8 @@ impl LxdComputeDriver {
                 .ensure_dhcp_client_volume(
                     aux_pool,
                     &dhcp_volume_name,
-                    &dhcp_binary_bytes,
+                    &net_tools.dhcp_client,
+                    &net_tools.busybox,
                     dhcp_client::DHCP_CLIENT_SCRIPT,
                 )
                 .await
@@ -688,7 +913,7 @@ impl LxdComputeDriver {
 
         let devices = mapping::build_create_devices(
             placement,
-            egress_acl.as_deref(),
+            Some(egress_acl.as_str()),
             gpu.is_some(),
             aux_pool,
             &volume_name,
@@ -697,9 +922,7 @@ impl LxdComputeDriver {
         );
         let profiles = mapping::build_profiles(template);
 
-        // Create the instance stopped so we can push the token and TLS files
-        // before the supervisor starts — avoids a race where the supervisor
-        // reads them before they have been written.
+        // 1. Create workload instance
         let op = self
             .lxd
             .create_instance(
@@ -712,14 +935,124 @@ impl LxdComputeDriver {
             )
             .await?;
         self.wait_operation(&op.id).await?;
+
+        // 2. Resolve the workload's immutable identity and stage the RFC 0012
+        //    boundary bootstrap. The identity comes from the pinned image's own
+        //    account database, read out of the created-but-stopped instance.
+        let identity = self
+            .resolve_workload_identity(&sandbox.name, spec, &image_alias)
+            .await?;
+        let fence = isolation::LxdFenceEvidence {
+            instance_name: sandbox.name.clone(),
+            network: placement.network.to_string(),
+            network_type: network.type_.to_string(),
+            egress_acl: egress_acl.clone(),
+            unexpected_networks: self
+                .unexpected_networks(&sandbox.name, placement.network)
+                .await?,
+        };
+        let artifacts = isolation::BoundaryArtifacts::new(
+            &sandbox.id,
+            &launch,
+            identity,
+            &fence,
+            Self::resource_claims(&sandbox.name, self.lxd.project(), &image_alias),
+        )?;
+        let workload_guest_files = artifacts.workload_files(&launch, child_env)?;
+
+        // 3. Configure and create companion supervisor instance
+        let sup_name = mapping::supervisor_instance_name(&sandbox.name);
+        let mut sup_config = mapping::build_supervisor_config(
+            sandbox,
+            spec,
+            &gateway_endpoint,
+            &self.config.log_level,
+        );
+        // `spec.sandbox_token` is deliberately not staged as a token file any
+        // more. It is the sandbox-scoped JWT, and the supervisor would offer
+        // whatever OPENSHELL_SANDBOX_TOKEN_FILE points at as its *gateway*
+        // credential — which the gateway rejects with "gateway token does not
+        // match the active sandbox identity". Under RFC 0012 both tokens come
+        // from the launch authentication bundle instead.
+        let mut sup_guest_files: Vec<(&str, Vec<u8>)> = Vec::new();
+        if self.config.guest_tls().is_some() {
+            sup_guest_files.extend(self.read_guest_tls_files().await?);
+            mapping::insert_guest_tls_environment(&mut sup_config);
+            if let Some(name) = &self.config.gateway_tls_server_name {
+                sup_config.insert(
+                    "environment.OPENSHELL_GATEWAY_TLS_SERVER_NAME".to_string(),
+                    name.clone(),
+                );
+            }
+        }
+        // The companion authenticates with the gateway's own bundle, forwarded
+        // unchanged. Its backend descriptor is pushed later: it carries the
+        // workload's address, which only exists once the workload is running.
+        sup_guest_files.push((
+            isolation::GUEST_AUTH_BUNDLE_PATH,
+            launch.supervisor_bundle()?,
+        ));
+
+        let sup_devices = mapping::build_supervisor_devices(
+            placement,
+            Some(egress_acl.as_str()),
+            aux_pool,
+            &volume_name,
+            aux_pool,
+            &dhcp_volume_name,
+        );
+        let sup_create = self
+            .lxd
+            .create_instance(
+                &sup_name,
+                &supervisor_image_alias,
+                sup_config,
+                sup_devices,
+                vec!["default".to_string()],
+                false,
+            )
+            .await;
+
+        let sup_op = match sup_create {
+            Ok(op) => op,
+            Err(e) => {
+                let _ = self.lxd.delete_instance(&sandbox.name).await;
+                drop(volume_use);
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = self.wait_operation(&sup_op.id).await {
+            // Only a companion this create actually made: the name may
+            // belong to another sandbox, which is exactly why the create
+            // could have failed.
+            if let Some(companion) = self.companion_of(&sandbox.name, Some(&sandbox.id)).await {
+                self.delete_instance_and_wait(&companion.name).await;
+            }
+            self.delete_instance_and_wait(&sandbox.name).await;
+            drop(volume_use);
+            return Err(e);
+        }
         drop(volume_use);
 
         let post_create = async {
-            self.push_guest_files(&sandbox.name, &guest_files).await?;
+            // Order is forced by the contract, not by preference: the boundary
+            // needs its bootstrap before it starts, and the companion needs a
+            // descriptor naming the workload's address before it dials. DHCP
+            // only assigns that address once the workload is up, so the
+            // workload starts first and the companion second.
+            self.push_owned_guest_files(&sandbox.name, artifacts.identity(), &workload_guest_files)
+                .await?;
 
             let op = self.lxd.start_instance(&sandbox.name).await?;
             self.wait_operation(&op.id).await?;
+
+            // Settling first: it restarts an init that exits immediately, and
+            // the companion must attach to the workload that ends up running,
+            // not to the one that just died.
             self.settle_after_start(&sandbox.name, &sandbox.id).await?;
+
+            self.attach_companion(&sandbox.name, &sandbox.id, &artifacts, sup_guest_files)
+                .await?;
 
             Ok::<(), DriverError>(())
         };
@@ -731,6 +1064,12 @@ impl LxdComputeDriver {
                 "post-create step failed; cleaning up instance"
             );
             let cleanup = async {
+                if let Some(companion) = self.companion_of(&sandbox.name, Some(&sandbox.id)).await {
+                    if let Ok(op) = self.lxd.stop_instance(&companion.name, true).await {
+                        let _ = self.wait_operation(&op.id).await;
+                    }
+                    self.delete_instance_and_wait(&companion.name).await;
+                }
                 if let Ok(op) = self.lxd.stop_instance(&sandbox.name, true).await {
                     let _ = self.wait_operation(&op.id).await;
                 }
@@ -797,6 +1136,258 @@ impl LxdComputeDriver {
         Ok(())
     }
 
+    /// Stages protected files into a guest, each with the owner that reads it.
+    async fn push_owned_guest_files(
+        &self,
+        name: &str,
+        identity: &isolation::ResolvedWorkloadIdentity,
+        files: &[isolation::GuestFile],
+    ) -> Result<(), DriverError> {
+        // The boundary's own directory must belong to it: it deletes its
+        // one-use bootstrap from there once it has been read.
+        self.lxd
+            .create_dir_in_instance_as(
+                name,
+                isolation::GUEST_BOUNDARY_DIR,
+                identity.uid,
+                identity.gid,
+                "0700",
+            )
+            .await?;
+        // The boundary installs its proxy CA here and chmods the directory, so
+        // it has to own it: /run itself belongs to root.
+        self.lxd
+            .create_dir_in_instance_as(
+                name,
+                isolation::GUEST_SUPERVISOR_CA_DIR,
+                identity.uid,
+                identity.gid,
+                "0755",
+            )
+            .await?;
+        for file in files {
+            self.lxd
+                .push_file_into_instance_as(
+                    name,
+                    file.path,
+                    &file.contents,
+                    file.uid,
+                    file.gid,
+                    file.mode,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Reads a file out of an instance's rootfs.
+    ///
+    /// Works on a created-but-stopped instance, which is how the workload's
+    /// account database is read before anything in it has run.
+    async fn fetch_guest_file(&self, name: &str, path: &str) -> Result<Vec<u8>, DriverError> {
+        let (bytes, _mode) = self.lxd.get_file_from_instance(name, path).await?;
+        Ok(bytes.to_vec())
+    }
+
+    /// Resolves the workload's immutable numeric identity from the pinned
+    /// image's own account database, honoring the gateway's selectors.
+    async fn resolve_workload_identity(
+        &self,
+        instance: &str,
+        spec: &DriverSandboxSpec,
+        resource_digest: &str,
+    ) -> Result<isolation::ResolvedWorkloadIdentity, DriverError> {
+        let request = spec.workload_identity.as_ref();
+        self.resolve_identity_against_image(
+            instance,
+            request.map_or("", |i| i.user.as_str()),
+            request.map_or("", |i| i.group.as_str()),
+            resource_digest,
+        )
+        .await
+    }
+
+    /// Re-resolves identity for a restart, where the original request is gone
+    /// but the image — and therefore the identity it resolves to — is the same.
+    async fn resolve_workload_identity_from_instance(
+        &self,
+        instance: &str,
+        resource_digest: &str,
+    ) -> Result<isolation::ResolvedWorkloadIdentity, DriverError> {
+        self.resolve_identity_against_image(instance, "", "", resource_digest)
+            .await
+    }
+
+    async fn resolve_identity_against_image(
+        &self,
+        instance: &str,
+        user: &str,
+        group: &str,
+        resource_digest: &str,
+    ) -> Result<isolation::ResolvedWorkloadIdentity, DriverError> {
+        let passwd = self.fetch_guest_file(instance, "/etc/passwd").await?;
+        // An image may legitimately ship no /etc/group; a numeric or primary
+        // group still resolves without it.
+        let group_db = self
+            .fetch_guest_file(instance, "/etc/group")
+            .await
+            .unwrap_or_default();
+        isolation::resolve_workload_identity(user, group, &passwd, &group_db, resource_digest)
+    }
+
+    /// Immutable LXD coordinates the boundary binds its attachment to.
+    ///
+    /// The companion sends these in the descriptor and the boundary requires
+    /// them to match before it opens its listener, so a descriptor left over
+    /// from another instance, project or image cannot be replayed.
+    fn resource_claims(
+        instance_name: &str,
+        project: &str,
+        image_alias: &str,
+    ) -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::from([
+            ("lxd.instance_name".to_string(), instance_name.to_string()),
+            ("lxd.project".to_string(), project.to_string()),
+            ("lxd.image_alias".to_string(), image_alias.to_string()),
+        ])
+    }
+
+    /// Lists managed networks the workload is attached to beyond its own.
+    ///
+    /// Read back from the created instance's expanded devices rather than
+    /// assumed from the request, so a profile that added a second NIC shows up
+    /// in the fence evidence instead of being silently attested away.
+    async fn unexpected_networks(
+        &self,
+        name: &str,
+        expected: &str,
+    ) -> Result<Vec<String>, DriverError> {
+        let instance = self.lxd.get_instance(name).await?;
+        let mut found: Vec<String> = instance
+            .expanded_devices
+            .values()
+            .filter(|device| device.get("type").map(String::as_str) == Some("nic"))
+            .filter_map(|device| device.get("network").or_else(|| device.get("parent")))
+            .filter(|network| network.as_str() != expected)
+            .cloned()
+            .collect();
+        found.sort();
+        found.dedup();
+        Ok(found)
+    }
+
+    /// Starts the supervisor companion against a running workload.
+    ///
+    /// A workload that is not running has no boundary to supervise: its
+    /// condition already says why, and attaching a companion would only
+    /// replace that reason with a less useful one. Leaving the companion
+    /// stopped is also what lets the sandbox be started again later.
+    async fn attach_companion(
+        &self,
+        name: &str,
+        sandbox_id: &str,
+        artifacts: &isolation::BoundaryArtifacts,
+        mut files: Vec<(&str, Vec<u8>)>,
+    ) -> Result<(), DriverError> {
+        let Some(workload_ip) = self.wait_for_instance_ipv4(name).await? else {
+            return Ok(());
+        };
+        files.push(artifacts.descriptor_file(name, workload_ip)?);
+
+        // The wait above runs unlocked and lasts up to a minute. A stop that
+        // arrives inside it takes the free lifecycle lock, stops both halves
+        // and returns — and an attach that then went ahead on what it saw
+        // before would start the companion of a sandbox that is meant to be
+        // down. That pair, a running companion over a stopped workload, is
+        // one no later call can repair: start refuses a companion that is not
+        // stopped, and stop returns early on a workload that already is. So
+        // everything the attach depends on is re-read here, under the lock it
+        // will hold until the companion is up.
+        let lifecycle_lock = self.instance_lifecycle_lock(name).await;
+        let _guard = lifecycle_lock.lock().await;
+
+        let instance = self.lxd.get_instance(name).await?;
+        if instance
+            .config
+            .get(mapping::KEY_SANDBOX_ID)
+            .map(String::as_str)
+            != Some(sandbox_id)
+        {
+            // Deleted and recreated under the same name while we waited.
+            return Ok(());
+        }
+        if !instance.status.eq_ignore_ascii_case("Running")
+            || instance.config.contains_key(mapping::KEY_STOP_INTENT)
+        {
+            return Ok(());
+        }
+        let Some(companion) = self.companion_of(name, Some(sandbox_id)).await else {
+            return Ok(());
+        };
+
+        self.push_guest_files(&companion.name, &files).await?;
+        // Cleared here, immediately before the start, so the window above
+        // reports a companion that is stopped on purpose rather than one that
+        // died.
+        self.clear_stop_intent(&companion.name).await;
+        let op = self.lxd.start_instance(&companion.name).await?;
+        self.wait_operation(&op.id).await?;
+        Ok(())
+    }
+
+    /// Waits for the workload to acquire the IPv4 address the companion dials.
+    ///
+    /// The address is assigned by DHCP from inside the container, so it
+    /// appears some time after start rather than at start.
+    ///
+    /// Returns `None` when the workload is no longer running. A sandbox whose
+    /// init exits immediately never gets an address, and that is a state the
+    /// gateway needs reported — as `ContainerExited`, with the console log to
+    /// explain it — rather than one to stall on and then tear down.
+    async fn wait_for_instance_ipv4(
+        &self,
+        name: &str,
+    ) -> Result<Option<std::net::Ipv4Addr>, DriverError> {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(BOUNDARY_ADDRESS_TIMEOUT_SECS);
+        loop {
+            match self.lxd.get_instance_state(name).await {
+                Ok(state) => {
+                    let found = state
+                        .network
+                        .iter()
+                        .filter(|(iface, _)| iface.as_str() != "lo")
+                        .flat_map(|(_, net)| net.addresses.iter())
+                        .filter(|a| a.family == "inet")
+                        .find_map(|a| a.address.parse::<std::net::Ipv4Addr>().ok());
+                    if let Some(ip) = found {
+                        return Ok(Some(ip));
+                    }
+                    if !state.status.eq_ignore_ascii_case("Running")
+                        && !state.status.eq_ignore_ascii_case("Starting")
+                    {
+                        tracing::warn!(
+                            name = %name,
+                            status = %state.status,
+                            "workload stopped before it acquired an address; not attaching \
+                             a supervisor companion to it"
+                        );
+                        return Ok(None);
+                    }
+                }
+                Err(e) => tracing::debug!(name = %name, %e, "instance state unavailable"),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(DriverError::Internal(format!(
+                    "workload instance {name:?} did not acquire an IPv4 address within \
+                     {BOUNDARY_ADDRESS_TIMEOUT_SECS}s; the supervisor companion cannot reach \
+                     its sandbox boundary without one"
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
     /// Starts a stopped sandbox again, idempotently.
     ///
     /// The instance keeps its token and configuration across a stop; the TLS
@@ -804,9 +1395,13 @@ impl LxdComputeDriver {
     /// ones. The stop marker is cleared before starting, so a sandbox that
     /// later exits by itself is reported as `ContainerExited` rather than as
     /// stopped on request, but restored if the start fails.
-    pub async fn start_sandbox(&self, name: &str) -> Result<(), DriverError> {
+    pub async fn start_sandbox(
+        &self,
+        name: &str,
+        launch_authentication: &[u8],
+    ) -> Result<(), DriverError> {
         let lifecycle_lock = self.instance_lifecycle_lock(name).await;
-        let sandbox_id = {
+        let (sandbox_id, artifacts, launch) = {
             let _guard = lifecycle_lock.lock().await;
 
             let instance = self.get_managed_instance(name).await?;
@@ -830,16 +1425,113 @@ impl LxdComputeDriver {
                 }
             }
 
-            let tls_files = self.read_guest_tls_files().await?;
-            self.push_guest_files(name, &tls_files).await?;
+            // By ownership, not by name: another sandbox may hold the
+            // name this sandbox's companion would have, and pushing TLS
+            // material into it — let alone starting it — would be acting on
+            // someone else's sandbox.
+            let sup = self
+                .companion_of(name, Some(&sandbox_id))
+                .await
+                .ok_or_else(|| {
+                    DriverError::FailedPrecondition(format!(
+                        "sandbox {name:?} has no supervisor companion; it cannot be started \
+                     without the trusted half, so delete it and create it again"
+                    ))
+                })?;
 
-            let had_stop_intent = instance.config.contains_key(mapping::KEY_STOP_INTENT);
-            if had_stop_intent {
-                let mut config = HashMap::new();
-                config.insert(mapping::KEY_STOP_INTENT.to_string(), None);
-                self.lxd.patch_instance_config(name, config).await?;
+            // Not best-effort: these are the gateway's current client
+            // credentials, and a companion that starts with the previous
+            // rotation's cannot reach the gateway at all. Failing the start
+            // says so, where swallowing it produced a sandbox that came up
+            // and then could not be talked to.
+            let tls_files = self.read_guest_tls_files().await?;
+            if !tls_files.is_empty() {
+                self.push_guest_files(&sup.name, &tls_files).await?;
             }
 
+            // The companion's marker stays until `attach_companion` actually
+            // starts it. Clearing it here would leave it, for the whole of
+            // the settle and the DHCP wait, as a companion that is stopped
+            // with no record of being stopped on purpose — which reads as
+            // "stopped unexpectedly", a reason the gateway treats as
+            // terminal, for a sandbox that is merely starting.
+
+            if !sup.status.eq_ignore_ascii_case("Stopped") {
+                return Err(DriverError::FailedPrecondition(format!(
+                    "companion supervisor instance is {}, not stopped; it can be started once it has stopped",
+                    sup.status
+                )));
+            }
+
+            // RFC 0012 gives every start-from-stopped a fresh session, so the
+            // previous generation's descriptor, bootstrap and TLS identity are
+            // all stale: the boundary rejects them. Stage new ones.
+            //
+            // The credentials are required here. The gateway omits them only
+            // when it already considers the sandbox Ready, which the status
+            // check above has already returned on.
+            let had_stop_intent = instance.config.contains_key(mapping::KEY_STOP_INTENT);
+            let launch = isolation::LaunchAuthentication::decode(launch_authentication)?;
+            let image_alias = instance
+                .config
+                .get(mapping::KEY_IMAGE_ALIAS)
+                .cloned()
+                .unwrap_or_default();
+            let network = instance
+                .config
+                .get(mapping::KEY_NETWORK)
+                .cloned()
+                .unwrap_or_default();
+            let identity = self
+                .resolve_workload_identity_from_instance(name, &image_alias)
+                .await?;
+            let fence = isolation::LxdFenceEvidence {
+                instance_name: name.to_string(),
+                network: network.clone(),
+                network_type: instance
+                    .config
+                    .get(mapping::KEY_NETWORK_TYPE)
+                    .cloned()
+                    .unwrap_or_default(),
+                egress_acl: instance
+                    .config
+                    .get(mapping::KEY_EGRESS_ACL)
+                    .cloned()
+                    .unwrap_or_default(),
+                unexpected_networks: self.unexpected_networks(name, &network).await?,
+            };
+            let artifacts = isolation::BoundaryArtifacts::new(
+                &sandbox_id,
+                &launch,
+                identity,
+                &fence,
+                Self::resource_claims(name, self.lxd.project(), &image_alias),
+            )?;
+            // The declared environment was recorded at create; the instance's
+            // own environment.* keys also carry plumbing the workload must
+            // not see.
+            let child_env: HashMap<String, String> = instance
+                .config
+                .get(mapping::KEY_CHILD_ENV)
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default();
+            self.push_owned_guest_files(
+                name,
+                artifacts.identity(),
+                &artifacts.workload_files(&launch, child_env)?,
+            )
+            .await?;
+
+            // Cleared here and nowhere earlier. Everything above can fail,
+            // and a sandbox that was stopped on request must still read as
+            // stopped on request if it does — not as one whose init exited,
+            // which the gateway treats as terminal rather than recoverable.
+            if had_stop_intent {
+                self.clear_stop_intent(name).await;
+            }
+
+            // Workload first: the companion's descriptor names the address
+            // DHCP only assigns once the workload is up.
             let op = match self.lxd.start_instance(name).await {
                 Ok(op) => op,
                 Err(e) => {
@@ -860,10 +1552,23 @@ impl LxdComputeDriver {
                 return Err(e);
             }
 
-            sandbox_id
+            (sandbox_id, artifacts, launch)
         };
 
-        self.settle_after_start(name, &sandbox_id).await
+        // Outside the lifecycle lock, and after settling: settling restarts an
+        // init that exits immediately, and the companion must attach to the
+        // workload that ends up running.
+        self.settle_after_start(name, &sandbox_id).await?;
+        self.attach_companion(
+            name,
+            &sandbox_id,
+            &artifacts,
+            vec![(
+                isolation::GUEST_AUTH_BUNDLE_PATH,
+                launch.supervisor_bundle()?,
+            )],
+        )
+        .await
     }
 
     /// Records that the driver stopped this sandbox deliberately (see
@@ -999,8 +1704,10 @@ impl LxdComputeDriver {
     ) -> Result<String, DriverError> {
         if network.type_ != NetworkType::Ovn {
             return Err(DriverError::FailedPrecondition(format!(
-                "--restrict-sandbox-egress needs sandboxes on an OVN network, where LXD applies \
-                 ACLs to each NIC; {network_name:?} is a {} network",
+                "sandboxes need an OVN network, where LXD applies ACLs to each NIC: the \
+                 egress ACL is the outer network fence OpenShell v0.1.0 requires before a \
+                 workload runs, and LXD rejects a per-NIC ACL anywhere else. {network_name:?} \
+                 is a {} network",
                 network.type_
             )));
         }
@@ -1076,24 +1783,39 @@ impl LxdComputeDriver {
         let _guard = lifecycle_lock.lock().await;
 
         let instance = self.get_managed_instance(name).await?;
+        let sandbox_id = instance
+            .config
+            .get(mapping::KEY_SANDBOX_ID)
+            .cloned()
+            .unwrap_or_default();
+
+        // Marked and swept before the workload's own state is consulted, and
+        // both unconditionally. A stopped workload is not the end of the
+        // story: its companion outlives it whenever the workload went down
+        // without it — an init that exited, a forced stop whose wait timed
+        // out, an attach that raced a stop — and returning here left that
+        // companion running with no call able to stop it. The marker is
+        // idempotent, and writing it on a workload that is already stopped is
+        // what lets a retried stop repair one that stopped without it and
+        // would otherwise read as having exited on its own.
+        self.set_stop_intent(name).await;
+
+        // Stop companion supervisor container before workload container
+        // (INV-4), and only one that is actually this sandbox's generation.
+        if let Some(companion) = self.companion_of(name, Some(&sandbox_id)).await {
+            self.set_stop_intent(&companion.name).await;
+            let _ = self.stop_instance_with_deadline(&companion.name).await;
+        }
+
         if instance.status.eq_ignore_ascii_case("Stopped") {
             return Ok(());
         }
 
-        // Record that this stop was asked for, before issuing it. LXD reports
-        // the same `Stopped` status however an instance went down, so without
-        // this marker a requested stop is indistinguishable from the init
-        // dying and would be reported as `ContainerExited` — surfacing to the
-        // user as `Error` instead of `Stopped`.
-        self.set_stop_intent(name).await;
+        // Stop workload container
+        self.stop_instance_with_deadline(name).await
+    }
 
-        // Ask politely first, but with a deadline. The sandbox's init is the
-        // supervisor, which does not act on LXD's shutdown signal, so an
-        // unbounded graceful stop never completes: the LXD operation stays
-        // RUNNING, the instance stays up, and StopSandbox only fails once the
-        // driver's own operation timeout fires. Bounding it here means the
-        // graceful attempt fails fast and the forced stop below is what
-        // actually stops the sandbox.
+    async fn stop_instance_with_deadline(&self, name: &str) -> Result<(), DriverError> {
         let graceful = async {
             let op = self
                 .lxd
@@ -1153,6 +1875,55 @@ impl LxdComputeDriver {
             // arbitrary LXD instance the caller happened to name correctly.
             return Ok(None);
         };
+        // A companion carries the sandbox id too, so the id alone does not say
+        // this is a sandbox. Naming a companion directly would otherwise
+        // delete another sandbox's trusted half and report *its* id as the
+        // deleted sandbox. Every other entry point filters this through
+        // `get_managed_instance`; this one has to do it itself, because it
+        // must still answer for an instance that is not fully managed.
+        if instance.config.get(mapping::KEY_ROLE).map(String::as_str)
+            == Some(mapping::ROLE_SUPERVISOR)
+        {
+            return Ok(None);
+        }
+
+        // Stop and delete companion supervisor instance first (INV-3).
+        // Resolved by ownership, not by name: an instance that merely holds
+        // this sandbox's companion name may be another sandbox's workload,
+        // and deleting that would destroy it.
+        //
+        // Both errors are fatal to the delete. Going on to remove the
+        // workload would leave the companion running with the gateway bundle
+        // it was staged with, and out of reach: the retry the gateway makes
+        // looks the sandbox up by the workload's name, gets a 404 and reports
+        // the sandbox deleted, so nothing ever comes back for it. Its NIC
+        // keeps the sandbox's ACLs in use and its disks keep the aux volumes
+        // pinned, so the collector cannot reclaim them either. Failing here
+        // instead leaves both halves in place for a retry that can still find
+        // them.
+        if let Some(companion) = self.companion_of(name, Some(&sandbox_id)).await {
+            match self.lxd.stop_instance(&companion.name, true).await {
+                Ok(op) => {
+                    if let Err(e) = self.wait_operation(&op.id).await {
+                        if !matches!(&e, DriverError::Lxd(lxd_err) if is_already_stopped(lxd_err)) {
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(e) if is_already_stopped(&e) => {}
+                Err(LxdError::Api {
+                    status_code: 404, ..
+                }) => {}
+                Err(e) => return Err(e.into()),
+            }
+            match self.lxd.delete_instance(&companion.name).await {
+                Ok(op) => self.wait_operation(&op.id).await?,
+                Err(LxdError::Api {
+                    status_code: 404, ..
+                }) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
 
         // Force-stop before deleting; LXD rejects deletion of running instances.
         match self.lxd.stop_instance(name, true).await {
@@ -1249,6 +2020,19 @@ mod tests {
             response.default_image,
             "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
         );
+        assert!(!response.driver_reports_runtime_readiness);
+        let resources = response
+            .resource_capabilities
+            .expect("resource capabilities are reported");
+        assert!(resources.cpu.expect("cpu").limit_supported);
+        assert!(resources.memory.expect("memory").limit_supported);
+        let gpu = resources.gpu.expect("gpu");
+        assert!(gpu.default_selection_supported);
+        // A count needs host GPU inventory the driver does not collect.
+        assert!(!gpu.count_selection_supported);
+        // The driver pulls images; it takes no rootfs tar from the gateway.
+        assert_eq!(response.rootfs_tar_staging_dir, "");
+        assert_eq!(response.rootfs_tar_max_bytes, 0);
     }
 
     #[tokio::test]
@@ -1647,6 +2431,9 @@ mod tests {
             .resolve_alias(&template.image)
             .await
             .unwrap();
-        assert_eq!(resolved, format!("openshell-oci-r4-{digest_hex}"));
+        assert_eq!(
+            resolved,
+            format!("openshell-oci-r{}-{digest_hex}", image::CONVERSION_REVISION)
+        );
     }
 }

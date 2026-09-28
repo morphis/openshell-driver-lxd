@@ -128,7 +128,9 @@ impl ComputeDriver for ComputeDriverService {
     ) -> Result<Response<StartSandboxResponse>, Status> {
         let req = request.into_inner();
         let name = resolve_name(&self.driver, &req.name, &req.sandbox_id).await?;
-        self.driver.start_sandbox(&name).await?;
+        self.driver
+            .start_sandbox(&name, &req.launch_authentication)
+            .await?;
         // Empty, as capabilities say: `supports_sandbox_authentication` is
         // false, and the gateway only binds a runtime identity for drivers
         // that advertise it.

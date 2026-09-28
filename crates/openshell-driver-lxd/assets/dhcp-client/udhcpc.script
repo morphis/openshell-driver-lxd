@@ -1,23 +1,33 @@
-#!/bin/sh
+#!/opt/openshell/net/busybox sh
 # SPDX-FileCopyrightText: 2026 Canonical Ltd.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # Minimal udhcpc bound/renew/deconfig event script for openshell-driver-lxd.
+#
+# udhcpc runs this as root inside the container, so — like the init script
+# that starts it — the interpreter and every program come from the driver's
+# own volume rather than from the user's image.
+
+# udhcpc passes the lease in the environment: $interface, $ip, $subnet,
+# $router, $dns and $domain are its calling convention, not ours.
+# shellcheck disable=SC2154
+
+BUSYBOX=/opt/openshell/net/busybox
 
 [ -z "$1" ] && echo "Error: should be called from udhcpc" && exit 1
 
 case "$1" in
     deconfig)
-        ip -4 addr flush dev "$interface" 2>/dev/null || true
+        "$BUSYBOX" ip -4 addr flush dev "$interface" 2>/dev/null || true
         ;;
 
     renew|bound)
         mask="${subnet:-24}"
-        ip -4 addr add "$ip/$mask" dev "$interface" 2>/dev/null || true
+        "$BUSYBOX" ip -4 addr add "$ip/$mask" dev "$interface" 2>/dev/null || true
 
         if [ -n "$router" ]; then
             for r in $router; do
-                ip -4 route add default via "$r" dev "$interface" 2>/dev/null || true
+                "$BUSYBOX" ip -4 route add default via "$r" dev "$interface" 2>/dev/null || true
                 break
             done
         fi
@@ -31,7 +41,7 @@ case "$1" in
                 for server in $dns; do
                     printf 'nameserver %s\n' "$server"
                 done
-            } > /etc/resolv.conf.dhcp && mv /etc/resolv.conf.dhcp /etc/resolv.conf
+            } > /etc/resolv.conf.dhcp && "$BUSYBOX" mv /etc/resolv.conf.dhcp /etc/resolv.conf || true
         fi
         ;;
 esac

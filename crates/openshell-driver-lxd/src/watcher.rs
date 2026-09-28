@@ -133,6 +133,10 @@ async fn managed_sandbox_ids(
         .list_instances()
         .await?
         .into_iter()
+        .filter(|instance| {
+            instance.config.get(mapping::KEY_ROLE).map(String::as_str)
+                != Some(mapping::ROLE_SUPERVISOR)
+        })
         .filter_map(|instance| {
             let id = instance.config.get(mapping::KEY_SANDBOX_ID)?.clone();
             Some((instance.name, id))
@@ -237,15 +241,66 @@ async fn run_once(
 
         // Only driver-managed instances are ours to report on; the event
         // stream carries every instance in the project.
+        if instance.config.get(mapping::KEY_ROLE).map(String::as_str)
+            == Some(mapping::ROLE_SUPERVISOR)
+        {
+            // Only the marker, never the name: a companion that does not
+            // record the workload it belongs to is not this driver's to
+            // attribute, and `<x>-supervisor` may simply be a sandbox called
+            // that.
+            let workload_name = instance
+                .config
+                .get(mapping::KEY_WORKLOAD_INSTANCE)
+                .cloned()
+                .filter(|workload_name| mapping::is_companion_of(&instance, workload_name, None));
+            if let Some(workload_name) = workload_name {
+                if let Ok(workload) = lxd.get_instance(&workload_name).await {
+                    // And the generation, now that there is a workload to ask:
+                    // a companion left behind by a previous sandbox of the
+                    // same name would otherwise push its state into this
+                    // sandbox's snapshot.
+                    if let Some(workload_id) = workload
+                        .config
+                        .get(mapping::KEY_SANDBOX_ID)
+                        .filter(|id| mapping::is_companion_of(&instance, &workload_name, Some(id)))
+                    {
+                        known_sandbox_ids.insert(workload_name.clone(), workload_id.clone());
+                        let mut sandbox = mapping::instance_to_driver_sandbox_live(&workload);
+                        mapping::aggregate_companion_status(&mut sandbox, Some(&instance));
+                        tracing::debug!(
+                            name = %workload_name,
+                            action = %action,
+                            companion_status = %instance.status,
+                            "pushing sandbox snapshot from companion lifecycle event"
+                        );
+                        tx.send(WatchEvent::Sandbox(Box::new(sandbox))).ok();
+                    }
+                }
+            }
+            continue;
+        }
+
         let Some(sandbox_id) = instance.config.get(mapping::KEY_SANDBOX_ID) else {
             continue;
         };
         known_sandbox_ids.insert(name.clone(), sandbox_id.clone());
 
+        // Checked, not just named: `<name>-supervisor` may be another
+        // sandbox's workload, and folding its state into this sandbox's
+        // readiness would report one sandbox's trouble as another's.
+        let companion = lxd
+            .get_instance(&mapping::supervisor_instance_name(&name))
+            .await
+            .ok()
+            .filter(|companion| {
+                mapping::is_companion_of(companion, &name, Some(sandbox_id.as_str()))
+            });
+
         // Off a live event: LXD is up to have sent it, so a stop it announces
         // is the init exiting or one that was asked for, never LXD going down
         // with the daemon or the host.
-        let sandbox = mapping::instance_to_driver_sandbox_live(&instance);
+        let mut sandbox = mapping::instance_to_driver_sandbox_live(&instance);
+        mapping::aggregate_companion_status(&mut sandbox, companion.as_ref());
         tracing::debug!(
             name = %name,
             action = %action,

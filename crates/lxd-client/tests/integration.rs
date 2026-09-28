@@ -518,11 +518,12 @@ async fn ensure_dhcp_client_volume_lifecycle_and_idempotency() {
     let vol_name = format!("test-dhcp-vol-{}", unique_name());
 
     let bin_bytes = b"dummy-udhcpc-binary";
+    let busybox_bytes = b"dummy-busybox-binary";
     let script_bytes = b"#!/bin/sh\necho test\n";
 
     // 1. Initial creation
     client
-        .ensure_dhcp_client_volume("default", &vol_name, bin_bytes, script_bytes)
+        .ensure_dhcp_client_volume("default", &vol_name, bin_bytes, busybox_bytes, script_bytes)
         .await
         .expect("initial ensure_dhcp_client_volume should succeed");
 
@@ -594,7 +595,7 @@ async fn ensure_dhcp_client_volume_lifecycle_and_idempotency() {
 
     // 2. Second call is an idempotent no-op (short circuits on exists check)
     client
-        .ensure_dhcp_client_volume("default", &vol_name, bin_bytes, script_bytes)
+        .ensure_dhcp_client_volume("default", &vol_name, bin_bytes, busybox_bytes, script_bytes)
         .await
         .expect("second ensure_dhcp_client_volume should succeed idempotently");
 

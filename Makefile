@@ -57,9 +57,13 @@ fmt-check:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 
-# Lints the shell scripts under scripts/ and tests/.
+# Lints every shell script in the repo, the two that run inside a sandbox
+# included: they are the container's boot path, so a mistake in them is a
+# sandbox that never starts.
 shellcheck:
 	shellcheck scripts/*.sh tests/rock/*.sh
+	shellcheck -s sh crates/openshell-driver-lxd/assets/openshell-init.sh \
+		crates/openshell-driver-lxd/assets/dhcp-client/udhcpc.script
 
 # Packs the openshell-gateway OCI rock with rockcraft.
 rock:

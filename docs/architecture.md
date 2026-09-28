@@ -2,8 +2,8 @@
 
 This document describes how `openshell-driver-lxd` is put together: the
 workspace's crates, the request flow through them, and the subsystems that
-back a sandbox's lifecycle (image conversion, supervisor injection,
-networking, event watching, and clean-up).
+back a sandbox's lifecycle (image conversion, boundary injection, networking,
+event watching, and clean-up).
 
 ## Overview
 
@@ -20,12 +20,40 @@ sandboxes as LXD/Incus system containers, talking to LXD over its REST API.
  └─────────────────┘   ComputeDriver service    └──────────────────────┘                        └──────────┘
                                                           │
                                                           ▼
-                                                 sandbox = LXD instance
-                                                 (container booted from a
-                                                  converted OCI image, with
-                                                  injected supervisor + DHCP
-                                                  client binaries)
+                                                 sandbox = two LXD instances
 ```
+
+## A sandbox is two containers
+
+OpenShell v0.1.0 (RFC 0012) split the monolithic supervisor in two, and the
+driver provisions both halves:
+
+```
+                       ┌──────────────────────────────────────┐
+     gateway  ◀──mTLS──▶│ <name>-supervisor                    │  the trusted half
+                       │   openshell-supervisor               │  holds the gateway
+                       │   --backend-descriptor-file          │  credentials and the
+                       │   --auth-bundle-file                 │  main-process spec
+                       └───────────────────┬──────────────────┘
+                                           │ Sandbox Protocol
+                                           │ TLS over TCP, pinned per launch
+                       ┌───────────────────▼──────────────────┐
+                       │ <name>                               │  the untrusted half
+                       │   openshell-sandbox --bootstrap      │  the user's image,
+                       │   (PID 1, then the workload)         │  and nothing the
+                       └──────────────────────────────────────┘  workload may not see
+```
+
+Only the workload instance is a sandbox as far as the gateway is concerned:
+every driver query filters the companion out by `user.openshell.role`, so a
+caller still sees one sandbox per sandbox. The companion's own state is folded
+into the sandbox's `Ready` condition, which is the only way it is visible at
+all.
+
+The gateway's `launch_authentication` is **split, never minted**: the companion
+gets the supervisor bundle verbatim, the workload gets only the gateway
+identity and the public verification keys. The supervisor's bearer tokens
+never reach the untrusted half.
 
 The gateway connects to the driver's Unix domain socket (default
 `/var/run/openshell-driver.sock`) at startup and drives the sandbox lifecycle
@@ -186,6 +214,8 @@ on demand (`image.rs`, `SkopeoImporter`):
    `/openshell-init.sh` and pointed to by `/sbin/init`, since LXD containers
    have no dedicated "init command" instance option — this lets a sandbox
    boot even inside a restricted project that forbids `raw.lxc`.
+   See [The workload half's boot path](#the-workload-halfs-boot-path) for why
+   that script runs nothing out of the image it is injected into.
 4. `mksquashfs` builds the rootfs squashfs and a `metadata.tar.xz` is built
    with `tar`/`xz`, forming an LXD unified image tarball.
 5. The image is imported into LXD and aliased by a prefix
@@ -216,9 +246,8 @@ carrying the driver's own alias/name conventions.
 
 ## Networking and egress
 
-Each sandbox gets a NIC on the resolved network. When
-`--restrict-sandbox-egress` is set, the driver additionally attaches an LXD
-network ACL (`egress.rs`) allowing only:
+Both of a sandbox's containers get a NIC on the resolved network, and the
+driver attaches an LXD network ACL (`egress.rs`) to each, allowing only:
 
 - outbound TCP to the resolved gateway endpoint, and
 - outbound traffic to public internet addresses (the complement of
@@ -228,14 +257,68 @@ network ACL (`egress.rs`) allowing only:
 with everything else — including inbound, except return traffic tracked by
 allowed connections — rejected. DNS needs no explicit rule: LXD lets an OVN
 NIC reach the network's own DNS resolvers regardless of ACLs. This confines
-the container as a whole (beyond the supervisor's own in-guest policy proxy)
+the containers as a whole (beyond the boundary's own in-guest policy proxy)
 from reaching the LAN, the LXD host, or other sandboxes.
+
+**This ACL is not optional, and it is why sandboxes need an OVN network.**
+From OpenShell v0.1.0 it is the sandbox's *outer network fence*: the driver
+projects it into the four guarantees upstream requires — default-deny egress,
+no unmanaged egress path, verified revocation, and failing closed if the
+controller is lost (`isolation.rs`) — and both halves of a sandbox validate
+that projection before the workload runs. A sandbox the driver cannot fence is
+a sandbox that never attaches, so `create_sandbox` refuses one up front.
+
+LXD only applies `security.acls` to an individual NIC on an OVN network; a
+bridge accepts an ACL on the network itself but not per-NIC, which is not a
+per-sandbox fence. So `create_sandbox` fails with `FailedPrecondition` on a
+bridge rather than provisioning a sandbox that cannot start.
 
 Inside the guest, network configuration is done by a static `busybox`/`udhcpc`
 binary (`dhcp_client.rs`) run against an event script
-(`assets/dhcp-client/udhcpc.script`), injected the same way as the supervisor
+(`assets/dhcp-client/udhcpc.script`), injected the same way as the boundary
 binary — as a digest-keyed read-only storage volume — so no DHCP client needs
 to be baked into the sandbox image itself.
+
+The workload must acquire its address before the companion can be told where
+to dial it, which is why create starts the workload first, waits for DHCP, and
+only then writes the companion's backend descriptor and starts it.
+
+### The workload half's boot path
+
+The workload container's rootfs is the user's own image, and the container's
+init is root inside it. Anything that init took *from* that image would
+therefore be the image's own code, running as root, before the boundary has
+dropped privilege — and it could replace the drop, or the boundary, with
+whatever it liked. The boundary is what reports the sandbox's confinement to
+the companion, so an image able to substitute it could report any confinement
+it wanted while having none.
+
+Podman, Docker and Kubernetes avoid this by having the runtime exec the
+boundary directly as the container's first process, with the identity and the
+capability set already applied. LXD has no equivalent instance option, so the
+init script reaches the same guarantee by naming everything explicitly:
+
+- its interpreter is the static busybox on the driver's own volume, named in
+  the script's `#!` line, not the image's `/bin/sh`;
+- every program it runs before handing over — `ip`, `awk`, `sed`, `grep`,
+  `hostname`, the DHCP client and its event script — is an absolute path on
+  that volume;
+- and the privilege drop is not a `setpriv` from the image but the driver's
+  own boundary binary, invoked as
+  `openshell-sandbox launch-capability-free <uid> <gid> <bootstrap> /sandbox`.
+  That subcommand — the one upstream's Podman driver uses for the same job —
+  chowns the workspace, empties every capability set, sets `no_new_privs` and
+  changes all three uid and gid triples, in the driver's own trusted code,
+  before it reads anything the workload could have written.
+
+Because that drop clears the supplementary group set outright, and the
+boundary then checks what it is running as against what the driver declared,
+the resolved identity never carries supplementary groups — see
+`isolation.rs::resolve_workload_identity`.
+
+The supervisor companion's rootfs is the driver's own supervisor image rather
+than the user's, so its half of the script may use what that image ships,
+including `curl` and the dynamic loader.
 
 ## Configuration and safety gates
 

@@ -50,6 +50,9 @@ sha2 = "0.10"
 # RFC 3339 timestamps (openshell-driver-lxd gc)
 time = { version = "0.3", default-features = false, features = ["parsing", "std"] }
 
+# X.509 generation (openshell-driver-lxd RFC 0012 boundary TLS material)
+rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc_rs"] }
+
 # TLS (lxd-client HTTPS transport)
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "tls12"] }
 tokio-rustls = "0.26"

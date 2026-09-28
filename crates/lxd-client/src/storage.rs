@@ -245,12 +245,19 @@ impl LxdClient {
         pool: &str,
         name: &str,
         binary_bytes: &[u8],
+        busybox_bytes: &[u8],
         script_bytes: &[u8],
     ) -> Result<(), LxdError> {
         self.ensure_single_file_volume(
             pool,
             name,
             &[
+                // `busybox` is the init scripts' interpreter and the source of
+                // every program they run; `udhcpc` is the DHCP client, under
+                // the name busybox's argv[0] dispatch needs when the two are
+                // the same binary. They are written separately because they
+                // need not be: a host may have a standalone udhcpc.
+                ("busybox", busybox_bytes, 0o755),
                 ("udhcpc", binary_bytes, 0o755),
                 ("udhcpc.script", script_bytes, 0o755),
             ],

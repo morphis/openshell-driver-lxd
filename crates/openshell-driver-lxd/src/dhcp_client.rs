@@ -14,6 +14,9 @@ pub(crate) const DHCP_CLIENT_SCRIPT: &[u8] = include_bytes!("../assets/dhcp-clie
 /// Candidate binary names to look for in `PATH`.
 const CANDIDATE_NAMES: &[&str] = &["busybox-static", "udhcpc", "busybox"];
 
+/// Candidate binary names specifically for busybox.
+const BUSYBOX_CANDIDATE_NAMES: &[&str] = &["busybox-static", "busybox"];
+
 /// Candidate full paths to probe when not found in `PATH`.
 const FALLBACK_PATHS: &[&str] = &[
     "/usr/bin/busybox-static",
@@ -26,6 +29,14 @@ const FALLBACK_PATHS: &[&str] = &[
     "/bin/busybox",
 ];
 
+/// Candidate full paths to probe for busybox when not found in `PATH`.
+const BUSYBOX_FALLBACK_PATHS: &[&str] = &[
+    "/usr/bin/busybox-static",
+    "/bin/busybox-static",
+    "/usr/bin/busybox",
+    "/bin/busybox",
+];
+
 /// Relative paths within `$SNAP` to probe when running inside a snap.
 const SNAP_RELATIVE_PATHS: &[&str] = &[
     "usr/bin/busybox-static",
@@ -34,6 +45,14 @@ const SNAP_RELATIVE_PATHS: &[&str] = &[
     "usr/bin/udhcpc",
     "bin/udhcpc",
     "sbin/udhcpc",
+    "usr/bin/busybox",
+    "bin/busybox",
+];
+
+/// Relative paths within `$SNAP` to probe for busybox when running inside a snap.
+const BUSYBOX_SNAP_RELATIVE_PATHS: &[&str] = &[
+    "usr/bin/busybox-static",
+    "bin/busybox-static",
     "usr/bin/busybox",
     "bin/busybox",
 ];
@@ -236,28 +255,98 @@ pub fn resolve_dhcp_client_binary(override_path: Option<&Path>) -> Result<PathBu
     ))
 }
 
-/// Computes a sha256 digest over the combined DHCP client binary and script bytes.
+/// Resolves a static busybox binary from the host environment to provide a shell and coreutils.
+pub fn resolve_static_busybox() -> Result<PathBuf, DriverError> {
+    for name in BUSYBOX_CANDIDATE_NAMES {
+        if let Some(p) = find_in_path(name) {
+            return Ok(p);
+        }
+    }
+
+    if let Ok(snap) = std::env::var("SNAP") {
+        let snap_dir = Path::new(&snap);
+        for sub in BUSYBOX_SNAP_RELATIVE_PATHS {
+            let candidate = snap_dir.join(sub);
+            if is_candidate(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    for path_str in BUSYBOX_FALLBACK_PATHS {
+        let p = Path::new(path_str);
+        if is_candidate(p) {
+            return Ok(p.to_path_buf());
+        }
+    }
+
+    Err(DriverError::ImageImport(
+        "no static busybox binary found on host; install busybox-static or busybox".into(),
+    ))
+}
+
+/// Computes a sha256 digest over everything the guest network volume holds, so
+/// that changing any of it gives a new, distinctly named volume.
 #[must_use]
-pub(crate) fn dhcp_client_digest(binary_bytes: &[u8]) -> String {
+pub(crate) fn dhcp_client_digest(binary_bytes: &[u8], busybox_bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(binary_bytes);
-    hasher.update(DHCP_CLIENT_SCRIPT);
+    // Length-prefixed, and with a layout revision, so the digest covers how
+    // the volume is laid out and not only what is in it: concatenating three
+    // blobs cannot tell `ab|c` from `a|bc`, and renaming an entry or changing
+    // its mode would otherwise reuse a volume built the old way.
+    hasher.update(VOLUME_LAYOUT_REVISION.to_be_bytes());
+    for part in [binary_bytes, busybox_bytes, DHCP_CLIENT_SCRIPT] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
     format!("sha256:{:x}", hasher.finalize())
 }
 
-/// Loads the DHCP client binary from the environment (or override path),
-/// returning the binary's contents and the combined digest.
-pub async fn load_dhcp_client(
+/// Bumped whenever the guest network volume's entry names or modes change,
+/// so hosts holding one built the old way build a new one.
+const VOLUME_LAYOUT_REVISION: u64 = 1;
+
+/// What a sandbox's guest-side network volume holds.
+///
+/// The busybox is resolved separately from the DHCP client, and deliberately:
+/// the DHCP client may be a standalone `udhcpc` rather than a busybox — that
+/// is what [`CANDIDATE_NAMES`] allows — and the init scripts run their shell
+/// and their applets through the busybox by name. Publishing a standalone
+/// `udhcpc` under that name would give them an interpreter that is not a
+/// shell, and no sandbox would boot.
+pub struct GuestNetTools {
+    /// Published as `udhcpc`, and invoked under that name so busybox's
+    /// `argv[0]` dispatch reaches the right applet.
+    pub dhcp_client: Vec<u8>,
+    /// Published as `busybox`: the init script's interpreter, and every
+    /// program it runs before the workload boundary takes over.
+    pub busybox: Vec<u8>,
+    pub digest: String,
+}
+
+/// Loads the guest-side network tooling from the environment (or the
+/// configured DHCP client override).
+pub async fn load_guest_net_tools(
     override_path: Option<&Path>,
-) -> Result<(Vec<u8>, String), DriverError> {
-    let path = resolve_dhcp_client_binary(override_path)?;
-    let binary_bytes = tokio::fs::read(&path).await.map_err(|e| {
-        DriverError::DhcpClient(format!(
-            "failed to read DHCP client binary from {path:?}: {e}"
-        ))
-    })?;
-    let digest = dhcp_client_digest(&binary_bytes);
-    Ok((binary_bytes, digest))
+) -> Result<GuestNetTools, DriverError> {
+    let read = |path: PathBuf, what: &'static str| async move {
+        tokio::fs::read(&path).await.map_err(move |e| {
+            DriverError::DhcpClient(format!("failed to read {what} from {path:?}: {e}"))
+        })
+    };
+
+    let dhcp_client = read(
+        resolve_dhcp_client_binary(override_path)?,
+        "DHCP client binary",
+    )
+    .await?;
+    let busybox = read(resolve_static_busybox()?, "static busybox binary").await?;
+    let digest = dhcp_client_digest(&dhcp_client, &busybox);
+    Ok(GuestNetTools {
+        dhcp_client,
+        busybox,
+        digest,
+    })
 }
 
 #[cfg(test)]
@@ -271,9 +360,9 @@ mod tests {
 
     #[test]
     fn digest_computation_is_deterministic_and_valid() {
-        let digest1 = dhcp_client_digest(b"dummy-udhcpc-1");
-        let digest2 = dhcp_client_digest(b"dummy-udhcpc-1");
-        let digest3 = dhcp_client_digest(b"dummy-udhcpc-2");
+        let digest1 = dhcp_client_digest(b"dummy-udhcpc-1", b"dummy-busybox");
+        let digest2 = dhcp_client_digest(b"dummy-udhcpc-1", b"dummy-busybox");
+        let digest3 = dhcp_client_digest(b"dummy-udhcpc-2", b"dummy-busybox");
 
         assert_eq!(digest1, digest2);
         assert_ne!(digest1, digest3);
@@ -334,10 +423,29 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn load_dhcp_client_with_dummy_executable() {
+    async fn load_guest_net_tools_with_dummy_executable() {
+        if resolve_static_busybox().is_err() {
+            // No busybox on this host; the init scripts' interpreter cannot
+            // be staged and the path under test is unreachable.
+            return;
+        }
         let dummy = create_dummy_elf_binary(true);
-        let (bytes, digest) = load_dhcp_client(Some(dummy.path())).await.unwrap();
-        assert!(!bytes.is_empty());
-        assert!(digest.starts_with("sha256:"));
+        let tools = load_guest_net_tools(Some(dummy.path())).await.unwrap();
+        assert!(!tools.dhcp_client.is_empty());
+        assert!(!tools.busybox.is_empty());
+        assert!(tools.digest.starts_with("sha256:"));
+        // The DHCP client override must not be published as the busybox: the
+        // init scripts would get an interpreter that is not a shell.
+        assert_ne!(tools.dhcp_client, tools.busybox);
+    }
+
+    /// The volume is digest-keyed, so a busybox change has to reach the name
+    /// or hosts keep mounting the old one.
+    #[test]
+    fn the_digest_covers_the_busybox_too() {
+        assert_ne!(
+            dhcp_client_digest(b"udhcpc", b"busybox-1"),
+            dhcp_client_digest(b"udhcpc", b"busybox-2")
+        );
     }
 }

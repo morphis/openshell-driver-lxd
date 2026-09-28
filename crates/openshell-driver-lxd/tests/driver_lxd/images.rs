@@ -55,6 +55,7 @@ fn cold_import_options() -> DriverOptions {
     let prefix = fresh_alias_prefix();
     DriverOptions {
         default_image: "registry.invalid/openshell/no-prewarm:latest".to_string(),
+        supervisor_image: Some(SMALL_IMAGE.to_string()),
         image_work_dir: scratch_root().join(format!("work-{prefix}")),
         image_cache_alias_prefix: prefix,
         ..Default::default()

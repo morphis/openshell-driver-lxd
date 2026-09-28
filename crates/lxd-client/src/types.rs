@@ -335,6 +335,11 @@ pub struct Profile {
     /// `type`, `network`, `pool`.
     #[serde(default)]
     pub devices: HashMap<String, HashMap<String, String>>,
+    /// Instance configuration the profile contributes, e.g. `environment.*`
+    /// and `security.*`. A caller-named profile can set these, so a driver
+    /// that admits caller profiles has to look at them.
+    #[serde(default)]
+    pub config: HashMap<String, String>,
 }
 
 /// An image as listed by `GET /1.0/images?recursion=1`.

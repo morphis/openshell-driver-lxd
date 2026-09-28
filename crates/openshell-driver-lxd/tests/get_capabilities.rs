@@ -33,4 +33,8 @@ async fn get_capabilities_returns_driver_info() {
         response.default_image,
         "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
     );
+    assert!(!response.driver_reports_runtime_readiness);
+    assert!(response.resource_capabilities.is_none());
+    assert_eq!(response.rootfs_tar_staging_dir, "");
+    assert_eq!(response.rootfs_tar_max_bytes, 0);
 }

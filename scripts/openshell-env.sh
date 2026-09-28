@@ -31,8 +31,7 @@
 #   OPENSHELL_TEST_POOL       pool for sandbox root disks (default: default)
 #   OPENSHELL_TEST_GATEWAY_IP host address the gateway binds and sandboxes
 #                             reach it at (default: derived from the network)
-#   OPENSHELL_TEST_DRIVER_ARGS  extra driver arguments, e.g.
-#                             --restrict-sandbox-egress (default: none)
+#   OPENSHELL_TEST_DRIVER_ARGS  extra driver arguments (default: none)
 
 set -euo pipefail
 
@@ -233,9 +232,9 @@ delete_project() {
         lxc storage volume delete "$STORAGE_POOL" "$volume" --project "$PROJECT" </dev/null >/dev/null 2>&1 || true
     done
     lxc project delete "$PROJECT" </dev/null >/dev/null
-    # --restrict-sandbox-egress leaves an ACL behind. It belongs to the
-    # project the network is in, not the one just deleted, so nothing else
-    # here takes it with them.
+    # The sandbox egress ACL is left behind. It belongs to the project the
+    # network is in, not the one just deleted, so nothing else here takes it
+    # with them.
     lxc network acl delete "openshell-egress-${NETWORK}" </dev/null >/dev/null 2>&1 || true
 }
 

@@ -9,6 +9,7 @@ pub mod error;
 pub(crate) mod gc;
 pub mod grpc;
 pub mod image;
+pub(crate) mod isolation;
 pub(crate) mod mapping;
 pub mod protocol;
 pub(crate) mod watcher;

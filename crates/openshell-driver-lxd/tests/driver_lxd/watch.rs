@@ -183,6 +183,7 @@ async fn out_of_band_start_is_pushed_as_running() {
     let mut watch = driver.watch().await;
 
     lxc(&["start", &name]);
+    lxc(&["start", &format!("{name}-supervisor")]);
 
     watch.expect_snapshot(&id, "True", "").await;
 }
