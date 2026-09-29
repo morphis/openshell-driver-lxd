@@ -3,6 +3,7 @@
 //! Network ACL management.
 
 use serde_json::json;
+use urlencoding::encode;
 
 use crate::client::LxdClient;
 use crate::error::LxdError;
@@ -139,7 +140,7 @@ impl LxdClient {
         };
 
         match self
-            .get::<serde_json::Value>(&format!("/1.0/network-acls/{name}"))
+            .get::<serde_json::Value>(&format!("/1.0/network-acls/{}", encode(name)))
             .await
         {
             Ok(response) => {
@@ -187,7 +188,7 @@ impl LxdClient {
     /// this waits on it before returning.
     pub async fn delete_network_acl(&self, name: &str) -> Result<(), LxdError> {
         match self
-            .delete::<Operation>(&format!("/1.0/network-acls/{name}"))
+            .delete::<Operation>(&format!("/1.0/network-acls/{}", encode(name)))
             .await
         {
             Ok(resp) => {

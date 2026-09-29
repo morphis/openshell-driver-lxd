@@ -46,14 +46,14 @@ impl LxdClient {
 
     /// `GET /1.0/instances/<name>`.
     pub async fn get_instance(&self, name: &str) -> Result<Instance, LxdError> {
-        self.get::<Instance>(&format!("/1.0/instances/{name}"))
+        self.get::<Instance>(&format!("/1.0/instances/{}", encode(name)))
             .await?
             .into_metadata()
     }
 
     /// `GET /1.0/instances/<name>/state`.
     pub async fn get_instance_state(&self, name: &str) -> Result<InstanceState, LxdError> {
-        self.get::<InstanceState>(&format!("/1.0/instances/{name}/state"))
+        self.get::<InstanceState>(&format!("/1.0/instances/{}/state", encode(name)))
             .await?
             .into_metadata()
     }
@@ -68,7 +68,7 @@ impl LxdClient {
     /// `PUT /1.0/instances/<name>/state` with `{action: "start"}`.
     pub async fn start_instance(&self, name: &str) -> Result<Operation, LxdError> {
         let body = json!({"action": "start"});
-        self.put::<Operation>(&format!("/1.0/instances/{name}/state"), body)
+        self.put::<Operation>(&format!("/1.0/instances/{}/state", encode(name)), body)
             .await?
             .into_metadata()
     }
@@ -95,7 +95,7 @@ impl LxdClient {
         timeout_secs: i64,
     ) -> Result<Operation, LxdError> {
         let body = json!({"action": "stop", "force": force, "timeout": timeout_secs});
-        self.put::<Operation>(&format!("/1.0/instances/{name}/state"), body)
+        self.put::<Operation>(&format!("/1.0/instances/{}/state", encode(name)), body)
             .await?
             .into_metadata()
     }
@@ -129,7 +129,7 @@ impl LxdClient {
 
     /// `DELETE /1.0/instances/<name>`.
     pub async fn delete_instance(&self, name: &str) -> Result<Operation, LxdError> {
-        self.delete::<Operation>(&format!("/1.0/instances/{name}"))
+        self.delete::<Operation>(&format!("/1.0/instances/{}", encode(name)))
             .await?
             .into_metadata()
     }
@@ -177,7 +177,7 @@ impl LxdClient {
 
         let encoded_path = encode(guest_path);
         self.post_raw(
-            &format!("/1.0/instances/{name}/files?path={encoded_path}"),
+            &format!("/1.0/instances/{}/files?path={encoded_path}", encode(name)),
             "application/octet-stream",
             &[
                 ("X-LXD-uid", uid.to_string().as_str()),
@@ -209,7 +209,7 @@ impl LxdClient {
         let encoded_path = encode(guest_path);
         let result = self
             .post_raw(
-                &format!("/1.0/instances/{name}/files?path={encoded_path}"),
+                &format!("/1.0/instances/{}/files?path={encoded_path}", encode(name)),
                 "application/octet-stream",
                 &[
                     ("X-LXD-uid", uid.to_string().as_str()),
@@ -250,7 +250,7 @@ impl LxdClient {
             let encoded_path = encode(&prefix);
             let result = self
                 .post_raw(
-                    &format!("/1.0/instances/{name}/files?path={encoded_path}"),
+                    &format!("/1.0/instances/{}/files?path={encoded_path}", encode(name)),
                     "application/octet-stream",
                     &[
                         ("X-LXD-uid", "0"),
@@ -286,7 +286,7 @@ impl LxdClient {
     /// the caller propagates its original, more informative error.
     async fn path_is_dir_in_instance(&self, name: &str, guest_path: &str) -> bool {
         let encoded_path = encode(guest_path);
-        let path = format!("/1.0/instances/{name}/files?path={encoded_path}");
+        let path = format!("/1.0/instances/{}/files?path={encoded_path}", encode(name));
         match self.get_raw_with_headers(&path).await {
             Ok((headers, _)) => {
                 headers
@@ -307,7 +307,7 @@ impl LxdClient {
         guest_path: &str,
     ) -> Result<(hyper::body::Bytes, u32), LxdError> {
         let encoded_path = encode(guest_path);
-        let path = format!("/1.0/instances/{name}/files?path={encoded_path}");
+        let path = format!("/1.0/instances/{}/files?path={encoded_path}", encode(name));
         let (headers, body) = self.get_raw_with_headers(&path).await?;
         let mode_str = headers
             .get("X-LXD-mode")
