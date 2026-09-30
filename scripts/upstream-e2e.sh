@@ -59,9 +59,8 @@ SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest@sha256:a
 # It is built from the source tree now rather than from a release wheel, and
 # upstream's pyproject.toml derives its version with setuptools-scm, which has
 # no `.git` to read here and no configured fallback. So it is told. The value
-# only has to be a valid PEP 440 version — nothing in the suites reads it —
-# and `0.1.0-pre.11` is not one.
-SDK_VERSION="0.1.0rc11"
+# only has to be a valid PEP 440 version — nothing in the suites reads it.
+SDK_VERSION="0.1.2"
 
 # Python the test environment is built with. cloudpickle, which the SDK's
 # exec_python uses to ship a test's function into the sandbox, serializes the

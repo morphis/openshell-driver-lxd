@@ -9,13 +9,13 @@
 #   sandbox-lifecycle  sandbox stop, start and deletion behaviour
 #
 # `openshell-conformance list` is the authority on what exists; these are what
-# v0.1.0-pre.11 registers. The runner is not released, so it is built from the
+# v0.1.2 registers. The runner is not released, so it is built from the
 # same pinned revision as everything else it drives.
 #
 # Usage: scripts/conformance.sh
 #
 # Environment (in addition to the OPENSHELL_TEST_* variables):
-#   CONFORMANCE_SCENARIOS  space-separated scenarios (default: "smoke sandbox-continuity")
+#   CONFORMANCE_SCENARIOS  space-separated scenarios (default: "smoke sandbox-lifecycle")
 
 set -euo pipefail
 

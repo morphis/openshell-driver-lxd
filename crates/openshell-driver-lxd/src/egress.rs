@@ -7,13 +7,15 @@
 //! sits on an ordinary network, though, and could otherwise reach the LAN, the
 //! LXD host, other sandboxes and any other instance.
 //!
-//! Every sandbox NIC therefore carries two LXD network ACLs, and between them
+//! Every sandbox NIC therefore carries LXD network ACLs, and between them
 //! they allow only:
 //!
 //! - public internet addresses, from [`network_rules`], one ACL per network
 //!   and shared by every sandbox on it;
-//! - the gateway endpoint, and the Sandbox Protocol between this sandbox's own
-//!   two halves, from [`sandbox_rules`], one ACL per sandbox;
+//! - the gateway endpoint, and the dial to its workload's boundary, from
+//!   [`companion_egress_rules`], on an ACL only the companion carries;
+//! - the Sandbox Protocol between this sandbox's own two halves, from
+//!   [`sandbox_protocol_rules`], on an ACL both halves carry;
 //!
 //! and reject everything else, inbound included (replies to allowed
 //! connections are let back in by the ACL's connection tracking).

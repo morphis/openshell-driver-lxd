@@ -41,7 +41,8 @@ case "$1" in
                 for server in $dns; do
                     printf 'nameserver %s\n' "$server"
                 done
-            } > /etc/resolv.conf.dhcp && "$BUSYBOX" mv /etc/resolv.conf.dhcp /etc/resolv.conf || true
+            } > /etc/resolv.conf.dhcp || true
+            "$BUSYBOX" mv /etc/resolv.conf.dhcp /etc/resolv.conf || true
         fi
         ;;
 esac

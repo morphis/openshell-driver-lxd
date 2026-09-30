@@ -309,7 +309,7 @@ fn to_driver_sandbox(instance: &Instance, stop_seen: StopSeen) -> DriverSandbox 
             sandbox_fd: String::new(),
             conditions: vec![ready_condition(instance, stop_seen)],
             deleting: false,
-            // Both are declared by the v0.1.0-pre.11 contract but not read by
+            // Both are declared by the v0.1.2 contract but not read by
             // the gateway yet: it takes the workload identity and the fence
             // from the supervisor's own attach, not from this snapshot.
             resolved_identity: None,

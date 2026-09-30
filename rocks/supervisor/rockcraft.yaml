@@ -31,7 +31,7 @@ parts:
     source: https://github.com/NVIDIA/OpenShell.git
     # Must match the `gateway` part of ../../rockcraft.yaml and the `sandbox`
     # part of ../sandbox/rockcraft.yaml.
-    source-commit: a8f98ec09de502bad1edc5b1a903382d27b8be0e # v0.1.0-pre.11
+    source-commit: 6648bd0c290efbc41ba131ee9831ee45cd431f94 # v0.1.2
     source-subdir: crates/openshell-supervisor
     build-packages:
       - build-essential
@@ -42,6 +42,11 @@ parts:
       - libssl-dev
       - pkg-config
       - protobuf-compiler
+    override-build: |
+      craftctl default
+      mv "${CRAFT_PART_INSTALL}/bin/openshell-supervisor" \
+        "${CRAFT_PART_INSTALL}/openshell-supervisor"
+      chmod 0555 "${CRAFT_PART_INSTALL}/openshell-supervisor"
 
   # The driver's init script runs before the supervisor and needs these; the
   # supervisor itself needs the trust store to verify the gateway. They are

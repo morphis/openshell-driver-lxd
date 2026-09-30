@@ -34,7 +34,7 @@ parts:
     source: https://github.com/NVIDIA/OpenShell.git
     # Must match the `gateway` part of ../../rockcraft.yaml and the
     # `supervisor` part of ../supervisor/rockcraft.yaml.
-    source-commit: a8f98ec09de502bad1edc5b1a903382d27b8be0e # v0.1.0-pre.11
+    source-commit: 6648bd0c290efbc41ba131ee9831ee45cd431f94 # v0.1.2
     build-packages:
       - build-essential
       - ca-certificates

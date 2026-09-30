@@ -167,7 +167,9 @@ fi
 #    Only the companion is given OPENSHELL_ENDPOINT — the workload boundary
 #    takes everything from its bootstrap — so the name-resolution branch
 #    below, which needs a `getent` from the rootfs, is only ever reached on
-#    the half whose rootfs is the driver's own.
+#    the half whose rootfs is the driver's own. A loopback name never gets
+#    that far: it is answered without asking either /etc/hosts or DNS, since
+#    neither has to know it.
 # ---------------------------------------------------------------------------
 endpoint_host() {
     _ep="${OPENSHELL_ENDPOINT#*://}"
@@ -198,11 +200,27 @@ if [ -n "${OPENSHELL_ENDPOINT:-}" ]; then
     if is_ip_address "$_host"; then
         OPENSHELL_HOST_IP="$_host"
     elif [ -n "$_host" ]; then
-        # shellcheck disable=SC2016  # $1 is awk's field, not a shell expansion
-        OPENSHELL_HOST_IP=$(getent hosts "$_host" 2>/dev/null | "$BUSYBOX" awk '{ print $1; exit }') || true
-        if [ -z "$OPENSHELL_HOST_IP" ]; then
-            ts "WARN: cannot resolve gateway host ${_host}; host.openshell.internal not seeded"
-        fi
+        # A loopback name is answered here rather than resolved. RFC 6761
+        # makes it a special-use name no DNS resolver has to answer, and the
+        # rootfs may be of no help either: the default sandbox image ships an
+        # empty /etc/hosts, so the files module of a getent finds nothing and
+        # the question goes to DNS, and upstream's pinned supervisor image
+        # ships no getent at all.
+        case "$_host" in
+            localhost|localhost.localdomain)
+                OPENSHELL_HOST_IP="127.0.0.1"
+                ;;
+            ip6-localhost|ip6-loopback)
+                OPENSHELL_HOST_IP="::1"
+                ;;
+            *)
+                # shellcheck disable=SC2016  # $1 is awk's field, not a shell expansion
+                OPENSHELL_HOST_IP=$(getent hosts "$_host" 2>/dev/null | "$BUSYBOX" awk '{ print $1; exit }') || true
+                if [ -z "$OPENSHELL_HOST_IP" ]; then
+                    ts "WARN: cannot resolve gateway host ${_host}; host.openshell.internal not seeded"
+                fi
+                ;;
+        esac
     fi
 else
     # shellcheck disable=SC2016  # $3 is awk's field, not a shell expansion

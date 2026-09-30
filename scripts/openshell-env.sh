@@ -40,20 +40,22 @@ set -euo pipefail
 
 # Bump the release here and in `OPENSHELL_REF` in the Makefile together, so
 # the vendored proto matches the gateway the suites run against.
-OPENSHELL_VERSION="0.1.0-pre.11"
+OPENSHELL_VERSION="0.1.2"
 OPENSHELL_REPO="https://github.com/NVIDIA/OpenShell"
-# The commit the tag points to. The gateway and CLI are *built* from it: no
-# v0.1.0-pre tag has a GitHub release, so there are no binaries to download
-# and no checksums to pin. v0.0.116 was the last release with assets.
+# The commit the tag points to. The gateway and CLI are *built* from it.
+# v0.1.2 does publish release binaries, but building from the pinned commit
+# is what keeps the gateway, CLI and conformance runner at one verified
+# revision rather than three artifacts whose provenance has to be pinned
+# separately.
 # shellcheck disable=SC2034  # used by the suites that source this file
-OPENSHELL_SOURCE_REV="a8f98ec09de502bad1edc5b1a903382d27b8be0e"
+OPENSHELL_SOURCE_REV="6648bd0c290efbc41ba131ee9831ee45cd431f94"
 
 # The two halves of a sandbox, pinned by digest and to the same revision as
 # the gateway. A gateway, a supervisor companion and a workload boundary from
 # different revisions do not make a working sandbox, and the version strings
 # these images report do not say which revision they came from.
-SUPERVISOR_IMAGE="ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_SOURCE_REV}@sha256:79f6c249f492bb3ed8079d72fc3ae6595d03b63db800d92df63d713ebf72fe4b"
-SANDBOX_BINARY_IMAGE="ghcr.io/nvidia/openshell/sandbox:${OPENSHELL_SOURCE_REV}@sha256:62338c8f73ebfec23270c4532b1b1f77d50591764f72a5d919b4d6227abceb72"
+SUPERVISOR_IMAGE="ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_SOURCE_REV}@sha256:d7b5264bb6bc56f4796e6fa3617b8e4a8d785be0b7293542efd8cc250b0fb67a"
+SANDBOX_BINARY_IMAGE="ghcr.io/nvidia/openshell/sandbox:${OPENSHELL_SOURCE_REV}@sha256:bf4797b6c511f2d8ba02955dbba4bf76c1f0dd6d83531420c5408d5f1fb9d72f"
 
 # The workload rootfs, pinned by digest: upstream's own default sandbox image.
 #
@@ -139,9 +141,12 @@ require_tools() {
 # Builds the gateway and the CLI from the pinned revision, into the cache.
 #
 # They used to be downloaded: every v0.0.x tag published release binaries with
-# checksums to pin. No v0.1.0-pre tag has a GitHub release at all, so there is
-# nothing to download, and building is the only way to run the suites against
-# the release the driver targets.
+# checksums to pin. No v0.1.0-pre tag has a GitHub release at all, so there was
+# nothing to download, and building was the only way to run the suites against
+# the release the driver targets. v0.1.x releases publish assets again, but the
+# suites keep building from the pinned commit: one revision across the gateway,
+# CLI and conformance runner, pinned by commit rather than by a set of asset
+# checksums.
 #
 # The build is cached by revision, so it happens once per bump rather than
 # once per run. It is a large Rust workspace; expect the first one to take a

@@ -136,15 +136,21 @@ const MKSQUASHFS_MEM: &str = "512M";
 /// files in a directory it owns so it can delete its one-use bootstrap.
 ///
 /// Revisions 6 to 9 are deliberately skipped. Pre-release builds of this work
-/// used them for conversions that differ from what revision 10 produces, so a
+/// used them for conversions that differ from what revision 11 produces, so a
 /// host that converted an image under one of those must not reuse it;
 /// advancing past them all is what makes that impossible rather than
 /// unlikely.
 ///
+/// Revision 11 answers a loopback gateway host without asking /etc/hosts or
+/// DNS: the default sandbox image ships an empty /etc/hosts and the pinned
+/// supervisor image ships no getent, so resolving `localhost` through the
+/// system depended on the network's resolver accepting a special-use name,
+/// which RFC 6761 says it need not.
+///
 /// The init script is baked into the converted image, so any change to
 /// `assets/openshell-init.sh` needs a bump here: without one, hosts that
 /// already converted an image keep booting the old script.
-pub const CONVERSION_REVISION: u32 = 10;
+pub const CONVERSION_REVISION: u32 = 11;
 
 /// Returns the deterministic LXD cache alias for the given content digest.
 ///
@@ -461,6 +467,7 @@ pub fn host_oci_arch() -> &'static str {
 }
 
 /// Trait defining the external OCI pull/convert/import capability.
+#[allow(clippy::double_must_use)]
 #[tonic::async_trait]
 pub trait OciImporter: Send + Sync {
     /// Resolves `reference` to its arch-specific manifest digest (e.g. `sha256:abcdef...`).
@@ -478,6 +485,7 @@ pub trait OciImporter: Send + Sync {
 }
 
 /// Abstraction over checking if an image alias exists in LXD.
+#[allow(clippy::double_must_use)]
 #[tonic::async_trait]
 pub trait ImageAliasChecker: Send + Sync {
     async fn image_alias_exists(&self, alias: &str) -> Result<bool, DriverError>;
@@ -1452,8 +1460,8 @@ mod tests {
         let digest_body = "ab".repeat(32);
         let digest = format!("sha256:{digest_body}");
         let alias = cache_alias(&digest);
-        assert_eq!(alias, format!("openshell-oci-r10-{digest_body}"));
-        assert_eq!(alias.len(), "openshell-oci-r10-".len() + 64);
+        assert_eq!(alias, format!("openshell-oci-r11-{digest_body}"));
+        assert_eq!(alias.len(), "openshell-oci-r11-".len() + 64);
     }
 
     /// Values observed from `umoci unpack --rootless` (umoci 0.4.7).

@@ -34,8 +34,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `path` is the rockcraft.yaml's directory; the gateway rock's is the
-        # repository root, which rockcraft-pack takes as an empty path.
+        # `path` is the rockcraft.yaml's directory. The gateway rock's is the
+        # repository root; an empty path makes rockcraft-pack fail after
+        # packing with `ENOENT: no such file or directory, scandir ''`, so it
+        # is spelled out as "." instead.
         rock: [gateway, supervisor, sandbox]
         arch: [amd64, arm64]
         include:
@@ -44,7 +46,7 @@ jobs:
           - arch: arm64
             runner: ubuntu-26.04-arm
           - rock: gateway
-            path: ""
+            path: .
           - rock: supervisor
             path: rocks/supervisor
           - rock: sandbox
@@ -71,7 +73,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: rock-${{ matrix.rock }}-${{ matrix.arch }}
-          path: ${{ matrix.path != '' && format('{0}/*.rock', matrix.path) || '*.rock' }}
+          path: ${{ format('{0}/*.rock', matrix.path) }}
           if-no-files-found: error
 
   manifest:

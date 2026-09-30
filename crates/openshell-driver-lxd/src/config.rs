@@ -52,7 +52,7 @@ pub use lxd_client::DEFAULT_PROJECT;
 /// strings these images report have been observed to be identical across
 /// builds that behave differently.
 ///
-/// The commit is v0.1.0-pre.11, the same revision `rockcraft.yaml` and both
+/// The commit is v0.1.2, the same revision `rockcraft.yaml` and both
 /// rocks under `rocks/` build from: the gateway, the supervisor companion and
 /// the workload boundary have to come from one revision or a sandbox does not
 /// attach.
@@ -62,8 +62,8 @@ pub use lxd_client::DEFAULT_PROJECT;
 /// `openshell-supervisor` rock is Ubuntu-based and needs no such help; prefer
 /// it where it is available.
 pub const DEFAULT_SUPERVISOR_IMAGE: &str = concat!(
-    "ghcr.io/nvidia/openshell/supervisor:a8f98ec09de502bad1edc5b1a903382d27b8be0e",
-    "@sha256:79f6c249f492bb3ed8079d72fc3ae6595d03b63db800d92df63d713ebf72fe4b"
+    "ghcr.io/nvidia/openshell/supervisor:6648bd0c290efbc41ba131ee9831ee45cd431f94",
+    "@sha256:d7b5264bb6bc56f4796e6fa3617b8e4a8d785be0b7293542efd8cc250b0fb67a"
 );
 
 /// Default OCI image the `openshell-sandbox` binary is extracted from.
@@ -73,8 +73,8 @@ pub const DEFAULT_SUPERVISOR_IMAGE: &str = concat!(
 /// whose own image supplies the rootfs. Pinned like
 /// [`DEFAULT_SUPERVISOR_IMAGE`], and to the same revision.
 pub const DEFAULT_SANDBOX_BINARY_IMAGE: &str = concat!(
-    "ghcr.io/nvidia/openshell/sandbox:a8f98ec09de502bad1edc5b1a903382d27b8be0e",
-    "@sha256:62338c8f73ebfec23270c4532b1b1f77d50591764f72a5d919b4d6227abceb72"
+    "ghcr.io/nvidia/openshell/sandbox:6648bd0c290efbc41ba131ee9831ee45cd431f94",
+    "@sha256:bf4797b6c511f2d8ba02955dbba4bf76c1f0dd6d83531420c5408d5f1fb9d72f"
 );
 
 /// Default host cache directory for extracted supervisor binaries.

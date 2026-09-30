@@ -71,7 +71,12 @@ jobs:
         run: make setup-ovn-test-env
 
       - name: Run ${{ matrix.suite }} suite
-        run: make test-${{ matrix.suite }}
+        # setup-ovn-test-env puts the runner user in the lxd group so it can
+        # reach the LXD socket, but group membership only applies to sessions
+        # started after the change, and this job's session predates it.
+        # Re-entering through sudo makes it resolve the groups afresh — the
+        # same trick canonical/craft-actions uses for rockcraft-pack.
+        run: sudo --user "$(whoami)" make test-${{ matrix.suite }}
 
       - name: Collect artifacts
         if: failure()

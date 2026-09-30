@@ -18,7 +18,8 @@ imports, directly or not:
 `tonic-prost-build`.
 
 They are vendored at the newest OpenShell release the driver targets, currently
-`v0.1.0-pre.11`. Unlike earlier bumps this one is **not** backwards compatible:
+`v0.1.2`. The vendored contract is the one v0.1.0 introduced, which is **not**
+backwards compatible with the earlier v0.0.x one:
 `GetGatewayListenerRequirements` is gone, `sandbox_name` is `name`, condition
 and event timestamps are `google.protobuf.Timestamp`, and a gateway now refuses
 a driver that does not return `extension` metadata or whose

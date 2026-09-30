@@ -151,7 +151,9 @@ mean to lose them. This script will not do it for you."
     ip link del "$BRIDGE" 2>/dev/null || true
     if [ -f "$DISK_IMAGE" ]; then
         loop="$(losetup -j "$DISK_IMAGE" | cut -d: -f1)"
-        [ -n "$loop" ] && losetup -d "$loop" 2>/dev/null || true
+        if [ -n "$loop" ]; then
+            losetup -d "$loop" 2>/dev/null || true
+        fi
         rm -f "$DISK_IMAGE"
     fi
     log "purged"
@@ -226,6 +228,13 @@ install_snaps() {
     fi
     snap list microovn >/dev/null 2>&1 || snap install microovn --channel="$MICROOVN_CHANNEL" --cohort="+"
     snap list microcloud >/dev/null 2>&1 || snap install microcloud --channel="$MICROCLOUD_CHANNEL" --cohort="+"
+    # The suites do not run as root, and the LXD socket is reachable only by
+    # its group: make the invoking user a member. Membership only applies to
+    # sessions started after this runs — CI re-enters through `sudo --user`
+    # for that reason.
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        usermod --append --groups lxd "$SUDO_USER"
+    fi
     # Nothing should move under a test run.
     snap refresh --hold lxd microovn microcloud >/dev/null
     snap list lxd microovn microcloud

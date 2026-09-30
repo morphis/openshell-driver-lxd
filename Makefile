@@ -104,7 +104,7 @@ UPSTREAM_PROTOS := compute_driver.proto options.proto extension.proto sandbox.pr
 
 # OpenShell release the vendored protos are taken from: the newest release the
 # driver targets.
-OPENSHELL_REF ?= v0.1.0-pre.11
+OPENSHELL_REF ?= v0.1.2
 
 # Sync proto/ with upstream NVIDIA/OpenShell at $(OPENSHELL_REF).
 sync-proto:
